@@ -99,8 +99,24 @@ class DispatchPolicy {
     const ready = Math.max(now, ...request.legs.map((leg) => leg.pickup.window.from))
     const slack = Math.max(0, deadline - ready - plan.travel)
     const urgency = Math.max(0, 1 - slack / (24 * HOUR))
-    const complexity = 1 + Math.min(0.35, plan.risk / 2400) + Math.max(0, request.legs.length - 1) * 0.08
-    return request.referenceFeeCents * complexity * (1.08 + urgency * 0.18)
+    const routeHours = plan.travel / HOUR
+    const privateStops = request.legs.reduce((sum, leg) =>
+      sum + Number(leg.pickup.privateAddress) + Number(leg.delivery.privateAddress), 0)
+    const premium = request.legs.some((leg) => leg.car.premium) ? 1 : 0
+    const lowBattery = request.legs.some((leg) =>
+      leg.car.electric && leg.car.chargePercent !== null && leg.car.chargePercent < 30) ? 1 : 0
+    const arrivalHour = Math.floor((request.arrivedAt % DAY) / HOUR)
+    const closingRisk = [13, 14, 20].includes(arrivalHour) ? 1 : 0
+    const complexity =
+      1.08 +
+      0.10 * Math.min(routeHours, 12) +
+      0.06 * Math.max(0, routeHours - 4) +
+      0.08 * Math.max(0, request.legs.length - 1) +
+      0.10 * privateStops +
+      0.10 * premium +
+      0.10 * lowBattery +
+      0.08 * closingRisk
+    return request.referenceFeeCents * complexity * (1 + urgency * 0.18)
   }
 
   plan(request: PriceRequest, deadline: number, now: number): RoutePlan | undefined {
@@ -354,7 +370,7 @@ const withoutWindows = (stops: StopRef[], before: number): StopRef[] =>
  * monotone hourly rise. The last step is slightly above the old cap for scarce gigs. */
 const rising = (now: number, fee: number, level: number): FeeStep[] =>
   (level === 1 ? [0] : [0, 1, 2, 3, 4, 5]).map((k) => {
-    const multiplier = [0.96, 1.04, 1.14, 1.26, 1.39, 1.52][k]!
+    const multiplier = [0.96, 1.02, 1.10, 1.20, 1.32, 1.45][k]!
     return { at: now + k * HOUR, feeCents: Math.max(1, Math.round(fee * multiplier)) }
   })
 
@@ -362,7 +378,7 @@ const rising = (now: number, fee: number, level: number): FeeStep[] =>
  * steps. This preserves urgency without paying the maximum before it is needed. */
 const steep = (now: number, fee: number, level: number): FeeStep[] =>
   (level === 1 ? [0] : [0, 1, 2, 3, 4]).map((k) => {
-    const multiplier = [1.5, 1.7, 1.9, 2.15, 2.4][k]!
+    const multiplier = [1.35, 1.55, 1.80, 2.05, 2.30][k]!
     return { at: now + k * 30, feeCents: Math.max(1, Math.round(fee * multiplier)) }
   })
 
