@@ -46,7 +46,10 @@ class DispatchPolicy {
         legs: request.legs.length,
         privateStops: plan.privateStops,
       })
-      if (slackHours <= 0 || onTimeProbability < 0.96) continue
+      // Practice calibration: the 0.96 model cutoff still produced 88.5%
+      // realized on-time delivery on a level-8 week. Keep a buffer above the
+      // 90% ranking threshold because shortage and weather are only estimates.
+      if (slackHours <= 0 || onTimeProbability < 0.98) continue
 
       // Optimize expected margin over a small, deterministic price grid. The
       // demand curve is intentionally conservative: a premium must compensate
