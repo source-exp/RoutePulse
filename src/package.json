@@ -1,0 +1,11 @@
+{
+  "name": "routepulse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RoutePulse autonomous pricing and dispatch engine for Spread. Zero dependencies: runs on Bun or Node 22.18+.",
+  "scripts": {
+    "start": "node --no-warnings starter.ts",
+    "starter": "bun starter.ts"
+  }
+}
