@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/routepulse-banner.png" alt="RoutePulse — TypeScript Dispatch for Spread's Marketplace" width="100%" />
+</p>
+
 # RoutePulse
 
 Autonomous pricing and dispatch system for **Spread** (Bahn Express vehicle transport challenge, Level 8).
