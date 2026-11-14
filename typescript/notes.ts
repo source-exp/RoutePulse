@@ -78,6 +78,10 @@ function stripNegations(clause: string): string {
   let s = clause.replace(/\(\s*(?:not|no|ei|inte)\b([^)]*)\)/gi, (full, rest: string) =>
     keepAfterNeg.test(rest) ? full : " ",
   )
+  // Strip negated contrast prefix before vaan/utan/but (e.g. "ei klo 12 vaan klo 15" -> " klo 15")
+  s = s.replace(/(?:^|[,\s])\b(?:not|ei|inte)\b([^,.;!?]*?)\b(?:vaan|utan|but)\b/gi, (full, rest: string) =>
+    keepAfterNeg.test(rest) ? full : " ",
+  )
   s = s.replace(/,\s*(?:not|ei|inte)\b([^,.;!?]*)/gi, (full, rest: string) => {
     if (keepAfterNeg.test(rest) || /\b(?:vaan|utan|men|but)\b/i.test(rest)) return full
     return " "
@@ -215,10 +219,23 @@ function extractClockMinutes(fragment: string): number | null {
   const f = foldAscii(fragment)
   const toks = f.match(/[a-z0-9]+/g) ?? []
 
+  const parseHalfDigitHour = (s: string): number | null => {
+    if (!/^\d{1,2}$/.test(s)) return null
+    const n = Number(s)
+    if (n >= 1 && n <= 5) return n + 12
+    if (n >= 6 && n <= 23) return n
+    return null
+  }
   for (let i = 0; i < toks.length - 1; i++) {
     const t = toks[i]!
+    if (t === "half" && toks[i + 1] === "past" && i + 2 < toks.length) {
+      const nxt = toks[i + 2]!
+      const wh = matchWordHourToken(nxt) ?? parseHalfDigitHour(nxt)
+      if (wh !== null) return wh * 60 + 30
+    }
     if (t === "halv" || t === "half" || approxToken(t, "puoli")) {
-      const wh = matchWordHourToken(toks[i + 1]!)
+      const nxt = toks[i + 1]!
+      const wh = matchWordHourToken(nxt) ?? parseHalfDigitHour(nxt)
       if (wh !== null) return wh * 60 - 30
     }
   }
@@ -519,13 +536,13 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
 
     const isPickupClose =
       !isNotBefore &&
-      (hasAnyStem(fc, ["saakka", "until"], ["sulke", "stang", "kiinni", "closes", "ketaan"]) ||
+      (hasAnyStem(fc, [], ["saakka", "until", "sulke", "stang", "kiinni", "closes", "ketaan"]) ||
         /\bwe\s+close\b/.test(fc) ||
         /\bshop\s+close/.test(fc) ||
         /\bingen\s+utlamning\b/.test(fc) ||
         /\bei\s+enaa\s+luovutuks/.test(fc) ||
         (hasAnyStem(fc, ["haku"], ["nouto", "haettav", "hakea", "hamta", "hamtning", "collect", "pick", "pickup"]) &&
-          (hasAnyStem(fc, ["ennen", "fore", "before"], ["viimeist", "senast"]) || /\bno\s+later\s+than\b/.test(fc))))
+          (hasAnyStem(fc, ["fore"], ["ennen", "before", "viimeist", "senast"]) || /\bno\s+later\s+than\b/.test(fc))))
 
     if (isPickupClose) {
       const closeMin = extractCorrectedMinutes(clause)

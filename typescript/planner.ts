@@ -178,6 +178,7 @@ export function computeOptionPlan(
   notes: readonly ParsedLegNote[],
   rawOptionDeadline: number,
   now: number,
+  deadlineAlreadyShifted = false,
 ): OptionPlan | undefined {
   if (legs.length === 0) return undefined
   const leg0 = legs[0]!
@@ -185,9 +186,10 @@ export function computeOptionPlan(
   const note0 = notes[0]
   const lastNote = notes[notes.length - 1]
 
-  const readyShiftDays = note0
-    ? Math.max(0, Math.floor(note0.readyAt / DAY) - Math.floor(leg0.pickup.window.from / DAY))
-    : 0
+  const readyShiftDays =
+    !deadlineAlreadyShifted && note0
+      ? Math.max(0, Math.floor(note0.readyAt / DAY) - Math.floor(leg0.pickup.window.from / DAY))
+      : 0
   const promisedDeadline = lastLeg.delivery.privateAddress
     ? rawOptionDeadline
     : shiftDeadlineBusinessDays(rawOptionDeadline, readyShiftDays)
@@ -257,7 +259,16 @@ export function computeOptionPlan(
     }
 
     const pickService = sameCustomerTradeIn ? 0 : 10
-    const pickStart = visitAt(pickEarliest, pickLatest, pickHours, pickService)
+    let pickStart = visitAt(pickEarliest, pickLatest, pickHours, pickService)
+    if (summerTyres) {
+      for (let iter = 0; iter < 8 && Number.isFinite(pickStart); iter++) {
+        const sw = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, pickStart, pickStart + driveRoad + 45)
+        if (!sw) break
+        snowOverlap = true
+        pickEarliest = Math.max(pickEarliest + 1, sw.to)
+        pickStart = visitAt(pickEarliest, pickLatest, pickHours, pickService)
+      }
+    }
     if (!Number.isFinite(pickStart)) return undefined
     if (i === 0) earliestPickupAt = pickStart
 
@@ -395,6 +406,7 @@ export function buildStopsForOrder(
   retriesByLeg: ReadonlyMap<number, RetryState>,
   now: number,
   endsAt: number,
+  omitSoftPickupCap = false,
 ): BuiltOrderStops {
   const combinedTradeIn = legIndices.length === 2 && order.legs.length === 2
   let manualLicence = false
@@ -419,7 +431,7 @@ export function buildStopsForOrder(
     summerTyres: false,
     noteDeadline: null,
   })
-  const plan = computeOptionPlan(map, snow, subLegs, subNotes, order.deadline, now)
+  const plan = computeOptionPlan(map, snow, subLegs, subNotes, order.deadline, now, true)
   const effectiveLastPickupAt = plan ? plan.effectiveLastPickupAt : order.lastPickupAt
 
   const stops: StopRef[] = []
@@ -451,11 +463,17 @@ export function buildStopsForOrder(
         retry.pickupFrom,
       )
 
-      // Avoid snow window for summer tyres
-      if (idx === 0 && notes[0]?.summerTyres) {
+      // Avoid snow window for summer tyres (including after overnight opening-hours jump!)
+      if (notes[0]?.summerTyres || note?.summerTyres) {
         const driveMin = map.roadMinutes(leg.pickup.placeId, leg.delivery.placeId)
-        const sw = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, Math.max(now, minStart), Math.max(now, minStart) + driveMin + 45)
-        if (sw) minStart = Math.max(minStart, sw.to)
+        const realPickH = note?.pickupHours ?? leg.pickup.hours
+        for (let iter = 0; iter < 8; iter++) {
+          const candPick = visitAt(Math.max(now, minStart), endsAt, realPickH, 10)
+          if (!Number.isFinite(candPick)) break
+          const sw = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, candPick, candPick + driveMin + 45)
+          if (!sw) break
+          minStart = Math.max(minStart + 1, sw.to)
+        }
       }
 
       if (leg.pickup.privateAddress) {
@@ -471,7 +489,7 @@ export function buildStopsForOrder(
         const narrowedPick = hoursNarrowed(realPickHours, leg.pickup.hours)
         if (narrowedPick && realPickHours) {
           const searchEarliest = Math.max(now + 10, minStart)
-          const searchLatest = Math.max(order.deadline, searchEarliest + 3 * DAY)
+          const searchLatest = omitSoftPickupCap ? endsAt - 60 : Math.max(order.deadline, searchEarliest + 3 * DAY)
           const dayWin = nextRealDayWindow(searchEarliest, Math.min(endsAt - 60, searchLatest), realPickHours, 45)
           if (dayWin && dayWin.to > now + 15) {
             pickupStop.window = {
@@ -480,7 +498,7 @@ export function buildStopsForOrder(
             }
           }
         } else if (minStart > leg.pickup.window.from && minStart > now) {
-          const toBound = order.deadline > minStart + 60 ? order.deadline : endsAt - 30
+          const toBound = !omitSoftPickupCap && order.deadline > minStart + 60 ? order.deadline : endsAt - 30
           if (toBound > minStart && toBound > now + 15) {
             pickupStop.window = { from: minStart, to: toBound }
           }
@@ -488,6 +506,7 @@ export function buildStopsForOrder(
 
         // Guard standard dealer stops against picking up 1-5m before raw lastPickupAt and missing 20:00 by drive variance
         if (
+          !omitSoftPickupCap &&
           idx === legIndices[0] &&
           effectiveLastPickupAt < order.lastPickupAt &&
           effectiveLastPickupAt > Math.max(now + 75, minStart + 30)
@@ -534,7 +553,7 @@ export function buildStopsForOrder(
       const minReachableDeliv = Math.max(now + 15, pickupStop.window?.from ?? leg.pickup.window.from) + driveMin + 20
 
       if (narrowedDeliv && realDelivHours) {
-        if (minReachableDeliv <= effDl) {
+        if (!omitSoftPickupCap && minReachableDeliv <= effDl) {
           const firstWin = nextRealDayWindow(minReachableDeliv, effDl, realDelivHours, 30)
           if (firstWin && firstWin.to - minReachableDeliv < 150) {
             const nextDayStart = (Math.floor(firstWin.to / DAY) + 1) * DAY
@@ -565,7 +584,7 @@ export function buildStopsForOrder(
             }
           }
         }
-      } else if (effDl < order.deadline && minReachableDeliv <= effDl && effDl > now + 30) {
+      } else if (!omitSoftPickupCap && effDl < order.deadline && minReachableDeliv <= effDl && effDl > now + 30) {
         deliveryStop.window = {
           from: leg.delivery.window.from,
           to: effDl,

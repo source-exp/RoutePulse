@@ -160,13 +160,13 @@ export class Client {
         clearTimeout(timer)
       }
       const policy = response.headers.get("ratelimit-policy")
-      if (policy) {
+      if (policy && Number(response.headers.get("ratelimit-limit")) > 0) {
         const charged = policy.split(";")[0]!.replaceAll('"', "")
         this.#bucketOf.set(route, charged)
         this.#buckets.set(charged, new Bucket(charged, response.headers))
       }
       if (response.status === 429) {
-        await sleep(Number(response.headers.get("retry-after") ?? 100))
+        await sleep(Math.max(25, Number(response.headers.get("retry-after")) || 100))
         continue
       }
       // An answer that breaks off after its first bytes comes from a server that stopped.

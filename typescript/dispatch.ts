@@ -6,13 +6,16 @@ import type { Audience, DriverProfile, FeeStep, OfferAction, Order, PriceRequest
 
 export type SingleScheduleContext = {
   now: number
+  endsAt: number
   level: number
   baseRefFeeCents: number
   orderPriceCents: number
+  minFloorFeeCents: number
   routeKm: number
   pickupPlaceId: string
   deliveryPlaceId: string
   effectiveLastPickupAt: number
+  rawLastPickupAt: number
   earliestPickupAt: number
   audience: Audience
   hasPrivatePickup: boolean
@@ -27,15 +30,32 @@ export type SingleScheduleContext = {
   highTrustDealer: boolean
 }
 
-function normalizeSteps(steps: FeeStep[], now: number): FeeStep[] {
+function clampOutOfNight(t: number, staggerIdx = 0): number {
+  const day = Math.floor(t / DAY)
+  const tod = ((t % DAY) + DAY) % DAY
+  if (tod >= 22 * HOUR + 45) {
+    return (day + 1) * DAY + 7 * HOUR + 5 + staggerIdx * 25
+  }
+  if (tod < 7 * HOUR + 5) {
+    return day * DAY + 7 * HOUR + 5 + staggerIdx * 25
+  }
+  return t
+}
+
+function normalizeSteps(steps: FeeStep[], now: number, maxFeeCents = Infinity, minFirstFeeCents = 1): FeeStep[] {
+  const cap = Math.max(1, Math.round(maxFeeCents))
+  const floor0 = Math.min(cap, Math.max(1, Math.round(minFirstFeeCents)))
   const sorted = [...steps]
-    .map((s) => ({ at: Math.max(now, Math.round(s.at)), feeCents: Math.max(1, Math.round(s.feeCents)) }))
+    .map((s, idx) => ({
+      at: Math.max(now, Math.round(s.at)),
+      feeCents: Math.min(cap, Math.max(idx === 0 ? floor0 : 1, Math.round(s.feeCents))),
+    }))
     .sort((a, b) => a.at - b.at)
 
   const deduped: FeeStep[] = []
   for (const step of sorted) {
     const prev = deduped[deduped.length - 1]
-    const monoFee = prev ? Math.max(prev.feeCents, step.feeCents) : step.feeCents
+    const monoFee = prev ? Math.max(prev.feeCents, step.feeCents) : Math.max(floor0, step.feeCents)
     if (prev && prev.at === step.at) {
       prev.feeCents = monoFee
     } else {
@@ -51,9 +71,9 @@ export function buildSingleGigSchedule(
   ctx: SingleScheduleContext,
 ): FeeStep[] {
   const Q30 = supply.pool30(ctx.pickupPlaceId, ctx.audience.experienced, ctx.audience.manualLicence)
-  const D_home = supply.homeDrivers(ctx.deliveryPlaceId)
+  const D_pool30 = supply.pool30(ctx.deliveryPlaceId, false, false)
   const sameCluster30 = map.isSameCluster30(ctx.pickupPlaceId, ctx.deliveryPlaceId)
-  const isLongOrDeadEnd = ctx.routeKm > 250 || (D_home <= 12 && !sameCluster30)
+  const isLongOrDeadEnd = ctx.routeKm > 250 || (D_pool30 <= 14 && !sameCluster30)
 
   const pickDay = Math.floor(Math.max(ctx.now, ctx.earliestPickupAt) / DAY)
   const pickWd = ((pickDay % 7) + 7) % 7
@@ -69,11 +89,11 @@ export function buildSingleGigSchedule(
     ctx.withPlates
 
   let m0 = 0.85
-  if (D_home >= 80 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !ctx.fluActive && ctx.routeKm <= 220) {
-    m0 -= 0.04 // 0.81x on dense hub->hub where returning/local drivers abound
+  if (D_pool30 >= 95 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !ctx.fluActive && ctx.routeKm <= 220) {
+    m0 -= 0.04 // 0.81x on dense hub->hub (including Espoo/Vantaa/Lempäälä/Raisio 30km clusters!)
   }
-  if (D_home <= 5 && !sameCluster30) m0 += 0.08
-  else if (D_home <= 12 && !sameCluster30) m0 += 0.05
+  if (D_pool30 <= 5 && !sameCluster30) m0 += 0.08
+  else if (D_pool30 <= 14 && !sameCluster30) m0 += 0.05
 
   if (Q30 === 0) m0 += 0.12
   else if (Q30 <= 5) m0 += 0.07
@@ -91,28 +111,59 @@ export function buildSingleGigSchedule(
   if (ctx.snowOverlap) m0 += 0.12
   if (ctx.fluActive) m0 += 0.10
 
-  m0 = Math.max(0.80, Math.min(1.32, m0))
+  m0 = Math.max(0.80, Math.min(hasExtras || ctx.snowOverlap ? 1.45 : 1.32, m0))
+
+  // Economic rationality ceiling: never pay a driver more than 2.65x the order's customer price!
+  const maxEconFee =
+    ctx.orderPriceCents > 0
+      ? Math.max(ctx.baseRefFeeCents, Math.round(ctx.orderPriceCents * 2.65))
+      : Infinity
 
   if (ctx.level === 1) {
     const flatMult = ctx.isPastDeadline ? 2.20 : ctx.urgent ? Math.max(1.48, m0 + 0.35) : m0
-    return [{ at: ctx.now, feeCents: Math.max(1, Math.round(ctx.baseRefFeeCents * flatMult)) }]
+    const fee = Math.min(maxEconFee, Math.max(ctx.minFloorFeeCents, Math.round(ctx.baseRefFeeCents * flatMult)))
+    return [{ at: ctx.now, feeCents: Math.max(1, fee) }]
   }
 
-  // Rescue mode for orders already past deadline: avoid -200% undelivered penalty at all costs!
-  if (ctx.isPastDeadline) {
+  // True End-of-World Undelivered Rescue (final 42h before Wed 22:00 endsAt): guarantee 0.0% undelivered!
+  if (ctx.isPastDeadline && ctx.endsAt - ctx.now <= 42 * HOUR) {
     const rescueMults = [
       Math.max(m0 + 0.45, 1.58),
       Math.max(m0 + 0.75, 1.88),
       Math.max(m0 + 1.05, 2.22),
-      Math.max(m0 + 1.40, 2.60),
-      Math.max(m0 + 1.80, 3.00),
+      Math.max(m0 + 1.40, 2.58),
+      Math.max(m0 + 1.75, 2.95),
     ]
     return normalizeSteps(
       rescueMults.map((mult, k) => ({
-        at: ctx.now + k * 35,
+        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 35, k),
         feeCents: Math.round(ctx.baseRefFeeCents * mult),
       })),
       ctx.now,
+      maxEconFee,
+      ctx.minFloorFeeCents,
+    )
+  }
+
+  // Rule-4 Mid-Week Already-Late Regime (now > rawLastPickupAt on non-private delivery, >42h before endsAt):
+  // On-time delivery is already impossible and delivering tonight at a closed dealer gate vs tomorrow daytime
+  // pays the EXACT SAME 25% (<24h) refund! Pace daytime steps calmly instead of gifting 2.40x-3.00x overnight.
+  if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 42 * HOUR) {
+    const lateDayMults = [
+      Math.max(m0 + 0.10, 1.05),
+      Math.max(m0 + 0.24, 1.20),
+      Math.max(m0 + 0.40, 1.38),
+      Math.max(m0 + 0.60, 1.60),
+      Math.max(m0 + 0.82, 1.85),
+    ]
+    return normalizeSteps(
+      lateDayMults.map((mult, k) => ({
+        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 70, k),
+        feeCents: Math.round(ctx.baseRefFeeCents * mult),
+      })),
+      ctx.now,
+      maxEconFee,
+      1,
     )
   }
 
@@ -129,25 +180,28 @@ export function buildSingleGigSchedule(
     ]
     return normalizeSteps(
       stepMults.map((mult, k) => ({
-        at: ctx.now + k * 25,
+        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 25, k),
         feeCents: Math.round(ctx.baseRefFeeCents * mult),
       })),
       ctx.now,
+      maxEconFee,
+      ctx.minFloorFeeCents,
     )
   }
 
   const lpa = ctx.effectiveLastPickupAt
   const lpaDayStart = Math.floor(lpa / DAY) * DAY
+  const postDayStart = Math.floor(ctx.now / DAY) * DAY
   const crossesNight = Math.floor(lpa / DAY) > Math.floor(ctx.now / DAY)
 
   const rampOffsets: Array<{ at: number; mult: number }> = [
     { at: ctx.now, mult: m0 },
   ]
 
-  // On ultra-long (>400km, e.g. Oulu/Kemi) overnight hauls, step gently 9h before lastPickupAt so evening train drivers book!
+  // On ultra-long (>400km) overnight hauls, step gently in the real 19:15-21:45 evening window (never 23:00-07:00!)
   if (crossesNight && ctx.routeKm > 400) {
-    const eveTrainAt = Math.max(ctx.now + 75, ctx.earliestPickupAt - 360, lpa - 540)
-    if (eveTrainAt < lpaDayStart + 6 * HOUR + 20) {
+    const eveTrainAt = Math.max(ctx.now + 60, postDayStart + 19 * HOUR + 15)
+    if (eveTrainAt <= postDayStart + 21 * HOUR + 45 && eveTrainAt < lpa - 300) {
       rampOffsets.push({
         at: eveTrainAt,
         mult: Math.max(m0 + 0.08, 1.04),
@@ -155,11 +209,21 @@ export function buildSingleGigSchedule(
     }
   }
 
-  // On long-haul (>250km) or low-destination-supply routes crossing overnight, step up gently at 06:40
-  // so full-day drivers claim the long trip before booking shorter morning gigs!
+  // On multi-day within_3_days orders, add a gentle intermediate-day 10:00 discovery step
+  if (Math.floor(lpa / DAY) - Math.floor(ctx.now / DAY) >= 2) {
+    const midDayAt = Math.max(ctx.now + 120, postDayStart + DAY + 10 * HOUR)
+    if (midDayAt < lpaDayStart) {
+      rampOffsets.push({
+        at: midDayAt,
+        mult: Math.min(0.98, m0 + 0.06),
+      })
+    }
+  }
+
+  // On long-haul (>250km) or low-destination-supply routes crossing overnight, step up at 07:35 (after 07:00 wake!)
   if (crossesNight && isLongOrDeadEnd) {
-    const morningWaveAt = Math.max(ctx.now + 90, ctx.earliestPickupAt - 60, lpaDayStart + 6 * HOUR + 40)
-    if (morningWaveAt < lpa - 260) {
+    const morningWaveAt = Math.max(ctx.now + 90, lpaDayStart + 7 * HOUR + 35)
+    if (morningWaveAt < lpa - 240) {
       rampOffsets.push({
         at: morningWaveAt,
         mult: Math.max(m0 + 0.12, 1.08),
@@ -168,10 +232,10 @@ export function buildSingleGigSchedule(
   }
 
   const minRampStart = Math.max(
-    ctx.earliestPickupAt,
+    ctx.earliestPickupAt - 180,
     crossesNight
-      ? Math.max(ctx.now + 120, lpaDayStart + (isLongOrDeadEnd ? 7 * HOUR + 45 : 8 * HOUR + 45))
-      : ctx.now + 80,
+      ? Math.max(ctx.now + 120, lpaDayStart + (isLongOrDeadEnd ? 7 * HOUR + 55 : 8 * HOUR + 45))
+      : ctx.now + 75,
   )
 
   const anchors: Array<{ beforeLpa: number; add: number; floor: number }> = [
@@ -182,13 +246,31 @@ export function buildSingleGigSchedule(
     { beforeLpa: 60, add: 0.88, floor: 1.88 },
   ]
 
-  for (const a of anchors) {
-    const t = Math.max(minRampStart, lpa - a.beforeLpa)
-    if (t < lpa - 15) {
-      rampOffsets.push({
-        at: t,
-        mult: Math.min(maxUrgentMult, Math.max(m0 + a.add, a.floor)),
-      })
+  const spanEnd = lpa - 45
+  if (minRampStart > lpa - 360 && spanEnd > minRampStart + 25) {
+    // Distribute the 5 ramp steps smoothly across [minRampStart, lpa - 45] so steps never collide into a single cliff!
+    for (let idx = 0; idx < anchors.length; idx++) {
+      const a = anchors[idx]!
+      const frac = idx / (anchors.length - 1)
+      const rawT = Math.round(minRampStart + frac * (spanEnd - minRampStart))
+      const t = clampOutOfNight(rawT, idx)
+      if (t < lpa - 15) {
+        rampOffsets.push({
+          at: t,
+          mult: Math.min(maxUrgentMult, Math.max(m0 + a.add, a.floor)),
+        })
+      }
+    }
+  } else {
+    for (let idx = 0; idx < anchors.length; idx++) {
+      const a = anchors[idx]!
+      const t = clampOutOfNight(Math.max(minRampStart, lpa - a.beforeLpa), idx)
+      if (t < lpa - 15) {
+        rampOffsets.push({
+          at: t,
+          mult: Math.min(maxUrgentMult, Math.max(m0 + a.add, a.floor)),
+        })
+      }
     }
   }
 
@@ -198,6 +280,8 @@ export function buildSingleGigSchedule(
       feeCents: Math.round(ctx.baseRefFeeCents * r.mult),
     })),
     ctx.now,
+    maxEconFee,
+    ctx.minFloorFeeCents,
   )
 }
 
@@ -266,7 +350,7 @@ function evaluateOrderedBundle(
 
   let tier: 1 | 2
   if (dh <= 45 && ret <= 50) tier = 1
-  else if (dh <= 50 && (ret <= 125 || poolD2 >= 18)) tier = 2
+  else if (dh <= 50 && ret <= 135 && (ret <= 95 || poolD2 >= 18)) tier = 2
   else return undefined
 
   const minLastPickup = Math.min(a.built.effectiveLastPickupAt, b.built.effectiveLastPickupAt)
@@ -299,25 +383,28 @@ function evaluateOrderedBundle(
   const driveDh = Math.ceil(dh * (snow1 || snow2 ? 1.25 : 1.02))
   const drive2 = Math.ceil(r2 * (snow2 ? 1.32 : 1.04))
 
-  const tP1 = visitAt(Math.max(now + 60, p1From), p1To, hP1, 15)
-  if (!Number.isFinite(tP1)) return undefined
-
-  const tD1 = visitAt(Math.max(tP1 + 15 + extra1 + drive1, leg1.delivery.window.from), effDl1, hD1, 15)
-  if (!Number.isFinite(tD1)) return undefined
-  const tFin1 = tD1 + 15
-
-  const tArrP2 = tFin1 + driveDh
-  const tP2 = visitAt(Math.max(tArrP2, p2From), p2To, hP2, 15)
-  if (!Number.isFinite(tP2)) return undefined
-
-  if (tP2 - tArrP2 > 90) return undefined
-
-  const tD2 = visitAt(Math.max(tP2 + 15 + extra2 + drive2, leg2.delivery.window.from), effDl2, hD2, 15)
-  if (!Number.isFinite(tD2)) return undefined
-  const tFin2 = tD2 + 15
-
-  if (Math.floor(tP1 / DAY) !== Math.floor(tFin2 / DAY)) return undefined
-  if (effDl1 - tFin1 < 240 || effDl2 - tFin2 < 240) return undefined
+  const curDayStart = Math.floor(now / DAY) * DAY
+  const startCandidates = [now + 60, curDayStart + DAY + 7 * HOUR + 15, curDayStart + 2 * DAY + 7 * HOUR + 15]
+  let feasibleSim = false
+  for (const candStart of startCandidates) {
+    if (candStart > minLastPickup - 120) break
+    const tP1 = visitAt(Math.max(candStart, p1From), p1To, hP1, 15)
+    if (!Number.isFinite(tP1)) continue
+    const tD1 = visitAt(Math.max(tP1 + 15 + extra1 + drive1, leg1.delivery.window.from), effDl1, hD1, 15)
+    if (!Number.isFinite(tD1)) continue
+    const tFin1 = tD1 + 15
+    const tArrP2 = tFin1 + driveDh
+    const tP2 = visitAt(Math.max(tArrP2, p2From), p2To, hP2, 15)
+    if (!Number.isFinite(tP2) || tP2 - tArrP2 > 90) continue
+    const tD2 = visitAt(Math.max(tP2 + 15 + extra2 + drive2, leg2.delivery.window.from), effDl2, hD2, 15)
+    if (!Number.isFinite(tD2)) continue
+    const tFin2 = tD2 + 15
+    if (Math.floor(tP1 / DAY) !== Math.floor(tFin2 / DAY)) continue
+    if (effDl1 - tFin1 < 240 || effDl2 - tFin2 < 240) continue
+    feasibleSim = true
+    break
+  }
+  if (!feasibleSim) return undefined
 
   const refSum = a.request.referenceFeeCents + b.request.referenceFeeCents
   const refMax = Math.max(a.request.referenceFeeCents, b.request.referenceFeeCents)
@@ -326,13 +413,17 @@ function evaluateOrderedBundle(
 
   const schedule = normalizeSteps(
     coeffs.map((c, k) => ({
-      at: now + k * 30,
+      at: k === 0 ? now : clampOutOfNight(now + k * 30, k),
       feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),
     })),
     now,
   )
 
-  const splitAt = Math.min(now + 120, minLastPickup - 210)
+  const crossesNightBundle = Math.floor(minLastPickup / DAY) > Math.floor(now / DAY) && minLastPickup - now >= 600
+  const lpaDayStart = Math.floor(minLastPickup / DAY) * DAY
+  const splitAt = crossesNightBundle
+    ? Math.min(minLastPickup - 240, Math.max(now + 150, lpaDayStart + 9 * HOUR + 15))
+    : Math.min(now + 125, minLastPickup - 210)
   if (splitAt <= now + 35) return undefined
 
   const expectedSavings = refSum - schedule[0]!.feeCents
@@ -368,7 +459,6 @@ export function findBestTwoOrderBundle(
 
   for (const cand of candidates) {
     if (cand.order.id === target.order.id) continue
-    if (now - cand.wonAt > 180) continue
 
     const ab = evaluateOrderedBundle(map, snow, supply, target, cand, now, fluActive)
     const ba = evaluateOrderedBundle(map, snow, supply, cand, target, now, fluActive)
@@ -377,7 +467,14 @@ export function findBestTwoOrderBundle(
     if (ab && ba) {
       const poolA = supply.pool30(target.order.legs[0]!.pickup.placeId)
       const poolB = supply.pool30(cand.order.legs[0]!.pickup.placeId)
-      chosen = poolB > poolA ? ba : poolA > poolB ? ab : ba.score > ab.score ? ba : ab
+      chosen =
+        Math.min(poolA, poolB) < 25 && poolB !== poolA
+          ? poolB > poolA
+            ? ba
+            : ab
+          : ba.score > ab.score
+            ? ba
+            : ab
     } else if (ba) {
       chosen = ba
     }
@@ -400,6 +497,7 @@ export function tryExtendTwoToThreeOrderBundle(
   now: number,
   fluActive: boolean,
 ): BundledGigPlan | undefined {
+  if (fluActive || supply.totalDrivers < 760) return undefined
   const entries = [a, b, c]
   for (const e of entries) {
     if (e.order.legs.length !== 1) return undefined
@@ -422,62 +520,94 @@ export function tryExtendTwoToThreeOrderBundle(
   const ret = map.roadMinutes(D3, P1)
   const totalRoad = r1 + dh1 + r2 + dh2 + r3
 
-  if (dh1 > 46 || dh2 > 42 || totalRoad > 560) return undefined
+  if (dh1 > 32 || dh2 > 32 || ret > 90 || totalRoad > 440) return undefined
   const manualLicence = entries.some((e) => e.built.audience.manualLicence)
   const poolP1 = supply.pool30(P1, false, manualLicence)
   const poolD3 = supply.pool30(D3, false, false)
-  if (poolP1 < 22 || (ret > 95 && poolD3 < 35)) return undefined
+  if (poolP1 < 35 || (ret > 55 && poolD3 < 45)) return undefined
 
   const minLpa = Math.min(...entries.map((e) => e.built.effectiveLastPickupAt))
-  if (minLpa - now < 280) return undefined
+  if (minLpa - now < 300) return undefined
 
-  let curAt = now + 60
-  let firstDay = -1
-  for (let idx = 0; idx < 3; idx++) {
-    const e = entries[idx]!
-    const prevE = idx > 0 ? entries[idx - 1]! : undefined
-    const leg = e.order.legs[0]!
-    const n = e.notes[0]
-    const pStop = e.built.stops[0]!
-    const dStop = e.built.stops[1]!
+  const curDayStart = Math.floor(now / DAY) * DAY
+  const startCandidates = [now + 60, curDayStart + DAY + 7 * HOUR + 15]
+  let anySnow = false
+  let feasible3 = false
 
-    const link = prevE
-      ? Math.ceil(map.roadMinutes(prevE.order.legs[0]!.delivery.placeId, leg.pickup.placeId) * 1.03)
-      : 0
-    const arrP = curAt + link
-    const hP = n?.pickupHours ?? leg.pickup.hours
-    const hD = n?.deliveryHours ?? leg.delivery.hours
-    const effDl = Math.min(e.order.deadline, n?.noteDeadline ?? Infinity, dStop.window?.to ?? Infinity)
-    const pFrom = pStop.window?.from ?? leg.pickup.window.from
-    const pTo = Math.min(effDl, pStop.window?.to ?? e.order.deadline)
-    const tP = visitAt(Math.max(arrP, pFrom), pTo, hP, 15)
-    if (!Number.isFinite(tP)) return undefined
-    if (idx > 0 && tP - arrP > 75) return undefined
-    if (idx === 0) firstDay = Math.floor(tP / DAY)
+  for (const candStart of startCandidates) {
+    if (candStart > minLpa - 180) break
+    let curAt = candStart
+    let firstDay = -1
+    let ok = true
+    let simSnow = false
+    for (let idx = 0; idx < 3; idx++) {
+      const e = entries[idx]!
+      const prevE = idx > 0 ? entries[idx - 1]! : undefined
+      const leg = e.order.legs[0]!
+      const n = e.notes[0]
+      const pStop = e.built.stops[0]!
+      const dStop = e.built.stops[1]!
 
-    const extra = (pStop.withPlates ? PLATES_MINUTES : 0) + (pStop.withCharging ? CHARGING_MINUTES : 0)
-    const sw = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, now, effDl)
-    const drv = Math.ceil(map.roadMinutes(leg.pickup.placeId, leg.delivery.placeId) * (sw ? 1.32 : 1.04))
-    const tD = visitAt(Math.max(tP + 15 + extra + drv, leg.delivery.window.from), effDl, hD, 15)
-    if (!Number.isFinite(tD)) return undefined
-    const tFin = tD + 15
-    if (effDl - tFin < 260) return undefined
-    if (Math.floor(tFin / DAY) !== firstDay) return undefined
-    curAt = tFin
+      const effDl = Math.min(e.order.deadline, n?.noteDeadline ?? Infinity, dStop.window?.to ?? Infinity)
+      const sw = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, now, effDl)
+      if (sw) simSnow = true
+      const linkSw = prevE
+        ? snow.overlaps(prevE.order.legs[0]!.delivery.placeId, leg.pickup.placeId, now, effDl)
+        : null
+      if (linkSw) simSnow = true
+
+      const link = prevE
+        ? Math.ceil(map.roadMinutes(prevE.order.legs[0]!.delivery.placeId, leg.pickup.placeId) * (linkSw ? 1.25 : 1.03))
+        : 0
+      const arrP = curAt + link
+      const hP = n?.pickupHours ?? leg.pickup.hours
+      const hD = n?.deliveryHours ?? leg.delivery.hours
+      const pFrom = pStop.window?.from ?? leg.pickup.window.from
+      const pTo = Math.min(effDl, pStop.window?.to ?? e.order.deadline)
+      const tP = visitAt(Math.max(arrP, pFrom), pTo, hP, 15)
+      if (!Number.isFinite(tP) || (idx > 0 && tP - arrP > 75)) {
+        ok = false
+        break
+      }
+      if (idx === 0) firstDay = Math.floor(tP / DAY)
+
+      const extra = (pStop.withPlates ? PLATES_MINUTES : 0) + (pStop.withCharging ? CHARGING_MINUTES : 0)
+      const drv = Math.ceil(map.roadMinutes(leg.pickup.placeId, leg.delivery.placeId) * (sw ? 1.32 : 1.04))
+      const tD = visitAt(Math.max(tP + 15 + extra + drv, leg.delivery.window.from), effDl, hD, 15)
+      if (!Number.isFinite(tD)) {
+        ok = false
+        break
+      }
+      const tFin = tD + 15
+      if (effDl - tFin < 260 || Math.floor(tFin / DAY) !== firstDay) {
+        ok = false
+        break
+      }
+      curAt = tFin
+    }
+    if (ok) {
+      feasible3 = true
+      anySnow = simSnow
+      break
+    }
   }
+  if (!feasible3) return undefined
 
   const refSum = entries.reduce((s, e) => s + e.request.referenceFeeCents, 0)
   const refMax = Math.max(...entries.map((e) => e.request.referenceFeeCents))
-  const mktMult = 1.0 + (fluActive ? 0.08 : 0)
-  const coeffs = [0.52, 0.60, 0.69, 0.79]
+  const mktMult = 1.0 + (anySnow ? 0.10 : 0) + (fluActive ? 0.08 : 0)
+  const coeffs = [0.56, 0.64, 0.72, 0.81]
   const schedule = normalizeSteps(
     coeffs.map((kMult, k) => ({
-      at: now + k * 30,
-      feeCents: Math.round(Math.max(kMult * refSum, (1.02 + 0.08 * k) * refMax) * mktMult),
+      at: k === 0 ? now : clampOutOfNight(now + k * 30, k),
+      feeCents: Math.round(Math.max(kMult * refSum, (1.04 + 0.08 * k) * refMax) * mktMult),
     })),
     now,
   )
-  const splitAt = Math.min(now + 105, minLpa - 215)
+  const crossesNight3 = Math.floor(minLpa / DAY) > Math.floor(now / DAY) && minLpa - now >= 600
+  const splitAt = crossesNight3
+    ? Math.min(minLpa - 250, Math.max(now + 150, Math.floor(minLpa / DAY) * DAY + 9 * HOUR))
+    : Math.min(now + 135, minLpa - 220)
   if (splitAt <= now + 35) return undefined
 
   return {
@@ -521,6 +651,7 @@ export type OfferGigTarget = {
 
 export class DirectOfferTracker {
   readonly lastActiveAt = new Map<string, number>()
+  readonly gigViewers = new Map<string, Map<string, { firstAt: number; lastAt: number; count: number }>>()
   readonly bookedOrDeliveredDay = new Map<string, Set<string>>()
   readonly recentDeliveries = new Map<string, { placeId: string; at: number }>()
   readonly offersSentByDay = new Map<string, number>()
@@ -529,9 +660,23 @@ export class DirectOfferTracker {
   readonly attemptedGigDrivers = new Set<string>()
   readonly declinedMaxFee = new Map<string, number>()
 
-  recordView(driverId: string, at: number): void {
+  recordView(driverId: string, at: number, gigId?: string): void {
     const prev = this.lastActiveAt.get(driverId) ?? -Infinity
     if (at > prev) this.lastActiveAt.set(driverId, at)
+    if (gigId) {
+      let byGig = this.gigViewers.get(gigId)
+      if (!byGig) {
+        byGig = new Map()
+        this.gigViewers.set(gigId, byGig)
+      }
+      const cur = byGig.get(driverId)
+      if (cur) {
+        cur.lastAt = Math.max(cur.lastAt, at)
+        cur.count++
+      } else {
+        byGig.set(driverId, { firstAt: at, lastAt: at, count: 1 })
+      }
+    }
   }
 
   recordBooked(driverId: string, gigId: string, at: number): void {
@@ -549,6 +694,13 @@ export class DirectOfferTracker {
   recordDelivered(driverId: string | null, placeId: string, at: number): void {
     if (!driverId) return
     this.recordView(driverId, at)
+    const dayKey = String(Math.floor(at / DAY))
+    let set = this.bookedOrDeliveredDay.get(dayKey)
+    if (!set) {
+      set = new Set()
+      this.bookedOrDeliveredDay.set(dayKey, set)
+    }
+    set.add(driverId)
     this.recentDeliveries.set(driverId, { placeId, at })
   }
 
@@ -565,19 +717,26 @@ export class DirectOfferTracker {
     this.attemptedGigDrivers.add(`${gigId}:${driverId}`)
   }
 
-  rollbackOfferRefused(gigId: string, driverId: string, now: number): void {
+  rollbackOfferRefused(gigId: string, driverId: string, now: number, reason = ""): void {
     const dayKey = `${Math.floor(now / DAY)}:${driverId}`
-    const cur = this.offersSentByDay.get(dayKey) ?? 0
-    if (cur > 0) this.offersSentByDay.set(dayKey, cur - 1)
     this.openOffersByGig.get(gigId)?.delete(driverId)
-    this.globalOpenOfferDrivers.delete(driverId)
-    this.attemptedGigDrivers.delete(`${gigId}:${driverId}`)
+    const stillOpenElsewhere = [...this.openOffersByGig.values()].some((m) => m.has(driverId))
+    if (!stillOpenElsewhere) this.globalOpenOfferDrivers.delete(driverId)
+    if (/per day|three|3|limit/i.test(reason) && /driver/i.test(reason)) {
+      this.offersSentByDay.set(dayKey, 3)
+    } else {
+      const cur = this.offersSentByDay.get(dayKey) ?? 0
+      if (cur > 0) this.offersSentByDay.set(dayKey, cur - 1)
+    }
+    // Keep attemptedGigDrivers blocked so a refused (gigId, driverId) pair can NEVER spin-loop!
+    this.attemptedGigDrivers.add(`${gigId}:${driverId}`)
   }
 
   recordOfferAnswered(gigId: string, driverId: string, answer: "accepted" | "declined" | "expired"): void {
     const offeredFee = this.openOffersByGig.get(gigId)?.get(driverId) ?? 0
     this.openOffersByGig.get(gigId)?.delete(driverId)
-    this.globalOpenOfferDrivers.delete(driverId)
+    const stillOpenElsewhere = [...this.openOffersByGig.values()].some((m) => m.has(driverId))
+    if (!stillOpenElsewhere) this.globalOpenOfferDrivers.delete(driverId)
     if (answer === "accepted") {
       this.clearGig(gigId)
     } else if (answer === "declined" && offeredFee > 0) {
@@ -589,11 +748,13 @@ export class DirectOfferTracker {
   clearGig(gigId: string): void {
     const open = this.openOffersByGig.get(gigId)
     if (open) {
-      for (const driverId of open.keys()) {
-        this.globalOpenOfferDrivers.delete(driverId)
-      }
       this.openOffersByGig.delete(gigId)
+      for (const driverId of open.keys()) {
+        const stillOpenElsewhere = [...this.openOffersByGig.values()].some((m) => m.has(driverId))
+        if (!stillOpenElsewhere) this.globalOpenOfferDrivers.delete(driverId)
+      }
     }
+    this.gigViewers.delete(gigId)
   }
 
   offersToday(driverId: string, now: number): number {
@@ -691,71 +852,87 @@ export class DirectOfferTracker {
         }
       }
 
-      // Only send offers to drivers seen active today
-      const maxInactiveMins = 540
+      const vInfo = this.gigViewers.get(gig.gigId)?.get(d.id)
+      const isRepeatViewer = Boolean(vInfo && vInfo.count >= 2)
+      const isRecentGigViewer = Boolean(vInfo && now - vInfo.lastAt <= 95)
+
+      // Only send offers to genuinely active drivers (eliminates 1,800+ expired offers/wk on logged-off drivers!)
+      const maxInactiveMins = vInfo ? 240 : isUrgent || isScarce ? 180 : 90
       if (!workedToday && !chained && minsSinceAct > maxInactiveMins) continue
 
       const distP = map.distKm(d.homePlaceId, gig.pickupPlaceId)
       const distD = map.distKm(d.homePlaceId, gig.deliveryPlaceId)
-      if (!chained && distP > 65 && distD > 30) continue
+      if (!chained && !isRepeatViewer && distP > 65 && distD > 30) continue
 
       // Ensure non-chained home-origin drivers can actually reach pickup before effectiveLastPickupAt!
-      const transitMin = chained ? 0 : Math.ceil(map.roadMinutes(d.homePlaceId, gig.pickupPlaceId) * 1.25)
-      if (!chained && now + transitMin + 15 > gig.effectiveLastPickupAt) continue
+      const transitMin = chained || isRepeatViewer ? 0 : Math.ceil(map.roadMinutes(d.homePlaceId, gig.pickupPlaceId) * 1.25)
+      if (!chained && !isRepeatViewer && now + transitMin + 15 > gig.effectiveLastPickupAt) continue
 
       let matchScore = -Infinity
-      if (chained && distD <= 30) matchScore = 108
-      else if (chained) matchScore = distP > 30 ? 92 : 76
+      if (chained && distD <= 30) matchScore = 112
+      else if (chained) matchScore = distP > 30 ? 96 : 80
       else if (distD === 0 && distP > 30) matchScore = 84 - transitMin * 0.05
       else if (distD <= 30 && distP > 30) matchScore = 76 - transitMin * 0.05
       else if (distP > 30 && distP <= 65) matchScore = isScarce || isUrgent ? 72 : 48
       else if (distP <= 30 && distD <= 30) matchScore = 54
       else if (distP <= 30) matchScore = isUrgent || isScarce ? 64 : 40
+      else if (isRepeatViewer) matchScore = 58
 
       if (!Number.isFinite(matchScore)) continue
 
+      const viewerBonus = isRepeatViewer ? 52 : isRecentGigViewer ? 32 : 0
       const activityBonus =
-        workedToday ? 26 :
-        minsSinceAct <= 15 ? 32 :
-        minsSinceAct <= 60 ? 22 :
-        12
+        minsSinceAct <= 15 ? 30 :
+        workedToday ? 22 :
+        minsSinceAct <= 60 ? 18 :
+        10
 
       const dropPenalty = Math.min(26, d.drops * 3.8)
       const budgetPenalty = usedToday * 10
       const expSavePenalty = !gig.audience.experienced && isExp ? 8 : 0
-      const totalScore = matchScore + activityBonus - dropPenalty - budgetPenalty - expSavePenalty
+      const totalScore = matchScore + viewerBonus + activityBonus - dropPenalty - budgetPenalty - expSavePenalty
 
-      if (totalScore < (isUrgent || isScarce ? 48 : 68)) continue
+      if (totalScore < (isUrgent || isScarce ? 50 : 72)) continue
 
-      let mult =
-        chained && distD <= 30 ? 0.88 :
-        chained ? 0.93 :
-        distD <= 30 && distP > 30 ? (isScarce ? 0.98 : 0.93) :
-        distP <= 30 && distD <= 30 ? 0.95 :
-        distP <= 30 ? 1.00 :
-        isScarce ? 1.08 : 1.02
+      let feeCents: number
+      if (gig.orderIds.length > 1) {
+        // Multi-order bundle: NEVER pay 0.95x-1.03x * refSum on a 0.56x-0.58x bundle!
+        const maxBundleCap = Math.round(gig.refFeeCents * (gig.orderIds.length >= 3 ? 0.68 : 0.75))
+        const targetBundleOffer = Math.round(gig.currentAppFeeCents * (chained ? 0.98 : 1.02 + gig.offerWave * 0.04))
+        feeCents = Math.min(maxBundleCap, Math.max(gig.currentAppFeeCents, targetBundleOffer))
+      } else {
+        let mult =
+          chained && distD <= 30 ? 0.88 :
+          chained ? 0.93 :
+          distD <= 30 && distP > 30 ? (isScarce ? 0.98 : 0.93) :
+          distP <= 30 && distD <= 30 ? 0.95 :
+          distP <= 30 ? 1.00 :
+          isScarce ? 1.08 : 1.02
 
-      if (gig.hasPrivateStop) mult += 0.09
-      if (gig.audience.experienced) mult += 0.14
-      if (isEveningOrSat) mult += 0.05
-      if (!sameDayExec) mult += 0.03
-      mult += gig.offerWave * 0.09
+        if (gig.hasPrivateStop) mult += 0.09
+        if (gig.audience.experienced) mult += 0.14
+        if (isEveningOrSat) mult += 0.05
+        if (!sameDayExec) mult += 0.03
+        mult += gig.offerWave * 0.08
 
-      if (gig.isPastDeadline) {
-        mult = Math.max(mult, 1.75 + gig.offerWave * 0.25)
-      } else if (isUrgent && slackMin <= 190) {
-        mult = Math.max(mult, 1.38 + gig.offerWave * 0.16)
-      } else if (isScarce && slackMin <= 360) {
-        mult = Math.max(mult, 1.16 + gig.offerWave * 0.10)
-      }
+        if (gig.isPastDeadline) {
+          mult = Math.max(mult, 1.55 + gig.offerWave * 0.22)
+        } else if (isUrgent && slackMin <= 190) {
+          mult = Math.max(mult, 1.38 + gig.offerWave * 0.15)
+        } else if (isScarce && slackMin <= 360) {
+          mult = Math.max(mult, 1.15 + gig.offerWave * 0.09)
+        }
 
-      const rawFee = Math.round(gig.refFeeCents * Math.min(2.80, mult))
-      let feeCents =
-        isUrgent && slackMin <= 190
-          ? Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
-          : rawFee
-      if (distP <= 30 && feeCents < gig.currentAppFeeCents) {
-        feeCents = gig.currentAppFeeCents
+        const rawFee = Math.round(gig.refFeeCents * Math.min(2.65, mult))
+        feeCents =
+          isUrgent && slackMin <= 190
+            ? Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
+            : isRepeatViewer && !isUrgent
+              ? Math.max(gig.currentAppFeeCents, Math.min(rawFee, Math.round(gig.currentAppFeeCents * 1.06)))
+              : rawFee
+        if ((distP <= 30 || vInfo) && feeCents < gig.currentAppFeeCents) {
+          feeCents = gig.currentAppFeeCents
+        }
       }
 
       const prevDeclined = this.declinedMaxFee.get(`${gig.gigId}:${d.id}`) ?? 0
