@@ -263,8 +263,11 @@ export class CompetitorMarketEstimator {
 
   onNewDay(day: number): void {
     if (day <= this.currentDay) return
-    // Recover baseline worldLogMean if Monday had an unflagged Price War (-20% = -0.223 log drop)
-    if (
+    // Recover baseline worldLogMean if Monday had an unflagged Price War (-20% = -0.223 log drop),
+    // while NEVER double-recovering when Monday already flagged priceWarToday!
+    if (this.priceWarToday) {
+      this.priceWarUsedThisWeek = true
+    } else if (
       this.level === 8 &&
       this.currentDay === 0 &&
       !this.priceWarUsedThisWeek &&
@@ -277,7 +280,6 @@ export class CompetitorMarketEstimator {
         Math.max(this.minWorldLog, this.worldLogMean + this.dayLogOffset - Math.log(0.80)),
       )
     }
-    if (this.priceWarToday) this.priceWarUsedThisWeek = true
     if (this.outageCenterToday) {
       const endSt = this.regionOutStats.get(this.outageCenterToday)
       if (endSt && (endSt.llr >= 1.5 || endSt.sumResIn / Math.max(1, endSt.nIn) >= 0.14)) {
@@ -389,7 +391,8 @@ export class CompetitorMarketEstimator {
     if (!quoteCents) return
 
     const pickupId = req.legs[0]!.pickup.placeId
-    const deliveryId = req.legs[req.legs.length - 1]!.delivery.placeId
+    const deliveryId =
+      req.legs.length > 1 ? req.legs[0]!.delivery.placeId : req.legs[req.legs.length - 1]!.delivery.placeId
     const tod = req.arrivedAt % DAY
     const inHours = tod >= 8 * HOUR && tod <= 18 * HOUR
     const ulp = unroundedListPriceCents(meta.legRoadKms, evalOpt)
@@ -617,7 +620,7 @@ export function evaluateMenuChoice(
       winSd += du * sSd
       win3d += du * (1 - sSd) * s3d
     } else if (wSd) {
-      const kNd = hasNdOffered ? sigmoid(4.8 * (0.18 - Math.max(0, Math.log(rSd / 1.0)))) : 1.0
+      const kNd = hasNdOffered ? sigmoid(4.8 * (0.18 - Math.log(rSd / 1.0))) : 1.0
       winSd += du * kNd
     } else if (wNd) {
       const kSd = hasSdOffered ? 1 - sigmoid(4.8 * (0.092 - Math.log(1.08 / rNd))) : 1.0
@@ -725,8 +728,6 @@ export class PricingEngine {
     const leadHours = Math.max(0.5, (plan.effectiveLastPickupAt - ctx.now) / HOUR)
     const pickDay = Math.floor(plan.earliestPickupAt / DAY)
     const pickWd = ((pickDay % 7) + 7) % 7
-    const isFri = pickWd === 4 ? 1 : 0
-    const isSat = pickWd === 5 ? 1 : 0
 
     // Deadline-day capacity guard (Next Monday dlDay >= 7 has 0 new requests + 3.5 execution days!)
     const dlDay = Math.floor(plan.effectiveDeadline / DAY)
@@ -738,6 +739,12 @@ export class PricingEngine {
     if (dlWd === 4 && dayLoad >= 0.92 && option.kind === "same_day") return undefined
     if (dayLoad >= 1.05 && option.kind === "same_day") return undefined
     if (dayLoad >= 1.20) return undefined
+
+    const hasPrivPick = plan.privatePickupCount > 0
+    const isFri = pickWd === 4 && (dlDay === pickDay || hasPrivPick || dayLoad >= 0.82) ? 1 : 0
+    const isSat = pickWd === 5 && (dlDay <= 6 || hasPrivPick || dayLoad >= 0.82) ? 1 : 0
+    const isFluSameDay = ctx.fluActiveToday && dlDay === Math.floor(ctx.now / DAY)
+    const isFluShortageRollover = ctx.fluActiveToday && !isFluSameDay && this.supply.totalDrivers < 720
 
     // Safety gates against zero-notification traps & isolated Arctic 2-driver dead-zones
     if (plan.premiumAny && Q30 === 0 && (Q65 < 10 || leadHours < 12)) return undefined
@@ -769,7 +776,7 @@ export class PricingEngine {
       (request.legs.length === 1 && plan.privateDeliveryCount > 0 ? 0.60 : 0) +
       (plan.needsChargingAny ? 0.50 : 0) +
       (plan.snowOverlap ? 0.38 : 0) +
-      (ctx.fluActiveToday ? 0.35 : 0) +
+      (isFluSameDay ? 0.32 : isFluShortageRollover ? 0.12 : 0) +
       0.30 * shortageFrac +
       sinkEtaLift +
       0.85 * Math.log(open30 + 1) +
@@ -846,7 +853,7 @@ export class PricingEngine {
     if (isFri || isSat) feeMult += 0.07
     if (over4h > 0) feeMult += (D_pool30 >= hubPoolThreshold ? 0.02 : 0.035) * over4h
     if (plan.snowOverlap) feeMult += 0.14
-    if (ctx.fluActiveToday) feeMult += 0.12
+    if (isFluSameDay) feeMult += 0.10
     if (batchLoad > 0.65) feeMult += 0.08 * (batchLoad - 0.65)
 
     const pEscalate = sigmoid(etaLate + 1.10)
@@ -916,7 +923,7 @@ export class PricingEngine {
                 0.08 * Math.max(0, Math.min(1, (currentOnTime - 0.955) / 0.025)) * Math.max(0, 1 - backlogExcess) -
                 0.10 * Math.min(1.4, backlogExcess) -
                 (currentOnTime < 0.942 ? 2.8 * (0.942 - currentOnTime) : 0) -
-                (ctx.fluActiveToday ? 0.07 : 0),
+                (ctx.fluActiveToday && this.supply.totalDrivers < 720 ? 0.04 : 0),
             ),
           )
         : 1.0
@@ -935,7 +942,7 @@ export class PricingEngine {
       0.22 * localSat * localSat +
       0.52 * daySat * daySat +
       0.32 * batchSat * batchSat
-    if (ctx.fluActiveToday) shadowMult += 0.10
+    if (isFluSameDay) shadowMult += 0.06
     if (leadHours < 5) shadowMult *= 1.18
 
     const slotShadowUnitCents = 520 + Math.round(135 * roadHours + 0.24 * request.referenceFeeCents)
@@ -1089,7 +1096,8 @@ export class PricingEngine {
     fasterOptionUnquoted: boolean,
   ): { priceCents: number; expectedMargin: number; winProb: number } | undefined {
     const pickupId = request.legs[0]!.pickup.placeId
-    const deliveryId = request.legs[request.legs.length - 1]!.delivery.placeId
+    const deliveryId =
+      request.legs.length > 1 ? request.legs[0]!.delivery.placeId : request.legs[request.legs.length - 1]!.delivery.placeId
     const probeNd = this.estimator.predictOption({
       arrivedAt: request.arrivedAt,
       dealerId: request.dealerId,
@@ -1179,7 +1187,8 @@ export class PricingEngine {
     }
 
     const pickupId = request.legs[0]!.pickup.placeId
-    const deliveryId = request.legs[request.legs.length - 1]!.delivery.placeId
+    const deliveryId =
+      request.legs.length > 1 ? request.legs[0]!.delivery.placeId : request.legs[request.legs.length - 1]!.delivery.placeId
     const probeNd = this.estimator.predictOption({
       arrivedAt: request.arrivedAt,
       dealerId: request.dealerId,
@@ -1319,9 +1328,10 @@ export class PricingEngine {
       } else if (d3B.dlWd !== 4 && (ndB.effCost - d3B.effCost >= 380 || ndB.dlWd === 4) && soloNd) {
         const baseEvWithout3d = bestEv
         const anchorSd = bestSd
+        const isThuFriBypass3d = Boolean(sdB && sdB.dlWd === 3 && ndB.dlWd === 4)
         const minSdSpread =
           sdB && anchorSd !== undefined
-            ? sdB.dlWd === 3 && ndB.dlWd === 4
+            ? isThuFriBypass3d
               ? Math.max(250, Math.round(sdB.trueCost - ndB.trueCost + 150))
               : Math.max(400, Math.round(sdB.effCost - ndB.effCost + 150))
             : 0
@@ -1349,7 +1359,8 @@ export class PricingEngine {
           cur3d = opt3dP
 
           const loNd = Math.max(ndB.minP, cur3d + 300)
-          const hiNd = anchorSd !== undefined ? Math.min(ndB.maxP, anchorSd - minSdSpread) : ndB.maxP
+          const hiNdByPct = anchorSd !== undefined && !isThuFriBypass3d ? Math.floor(anchorSd / 1.12) : Infinity
+          const hiNd = anchorSd !== undefined ? Math.min(ndB.maxP, anchorSd - minSdSpread, hiNdByPct) : ndB.maxP
           if (hiNd >= loNd) {
             let optNdP = curNd
             optEv = -1e9
@@ -1371,7 +1382,8 @@ export class PricingEngine {
 
         let finalSd = anchorSd
         if (sdB && finalSd !== undefined) {
-          const loSd = Math.max(sdB.minP, curNd + minSdSpread)
+          const dynPctFloor = isThuFriBypass3d ? 0 : Math.round(curNd * 1.12)
+          const loSd = Math.max(sdB.minP, curNd + minSdSpread, dynPctFloor)
           const hiSd = Math.max(loSd + 200, sdB.maxP)
           let optSdP = finalSd
           let optEv = -1e9
