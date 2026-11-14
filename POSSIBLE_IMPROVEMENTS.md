@@ -305,6 +305,25 @@ We queried the full server reveals (`reveal()`, `events()`, `snapshot()`) of all
 - Per `/judging`, once a team finishes in the **Top 10 ranked margins** on Sunday `08:35`, **margin no longer counts** — the jury selects the winners on **Elegance, Clarity, Creativity, and Robustness** (submission closes **Sunday 10:00** on Junction: submission hash from `/team`, GitHub link, and **5–10 slides**).
 - Structure the 5–10 slides around **one claim + measured same-seed Level-8 A/B delta per slide** (*Idea $\to$ Why $\to$ Measured Effect on Margin & On-Time across the same N seeds*), plus explicit slides on **what did not work** (e.g., naive 3-car bundle cannibalization, fixed daily quote caps, aggressive flat markups) and **what would break the system**.
 
+---
+
+## Pass 9 — Implemented & Verified Same-Seed A/B Results (`1058099` & `7906254`)
+
+- **`1058099` (Stage 1–2 Dispatch, Note, Rule-4 Cliff & `--final` Stream Hardening):**
+  - 5-Seed Total: **€83,723.14** (`+€1,360.12` vs `c5421ee`), `spread-1`: **€14,514.87** (`+€901.13`), 6-Seed Total: **€98,238.01** (`+€2,261.25`, `0.0%` undelivered).
+- **`7906254` (Stage 3 Joint `batchId` Portfolio Ranker, Copula Menu Optimizer, `lateCount` `-0.125` Decay, `projTrust` Cap & Viewer Offers):**
+  - `paired-variant-1`: **€12,420.98** (`392` ord, `98.5%` OT, `0.0%` ND)
+  - `opportunity-compare-1`: **€14,672.56** (`344` ord, `98.0%` OT, `0.0%` ND)
+  - `quant-compare-1`: **€18,659.34** (`472` ord, `96.0%` OT, `0.0%` ND)
+  - `panel-compare-1`: **€20,104.55** (`495` ord, `98.4%` OT, `0.0%` ND)
+  - `experiment-route-fee`: **€20,252.46** (`503` ord, `97.0%` OT, `0.0%` ND)
+  - **5-Seed Total:** **€86,109.89** (`+€3,746.87` vs `c5421ee`, `+€14,416.47` vs `4ec0232`), `spread-1`: **€15,867.61**, **6-Seed Total:** **€101,977.50** (`+€6,000.74`).
+- **Verified Negative A/B Ablations (Do NOT Re-Apply Without Full Refit):**
+  1. `stage3a` (penalizing small `<12`-car `batchId`s & adding `unresolvedQuotes` into `etaLate`'s `open30`): over-throttled `paired-variant-1` (`€10,963`) and `opportunity-compare-1` (`€13,154`) — fixed in `7906254` by gating `batchLoad` to `seenCount >= 12` and separating `pending30` (`localSat`) from `open30` (`etaLate`).
+  2. `stage4-v10` (`1,150c` fixed per-slot shadow unit + removing `shortageFrac` from `etaLate`): dropped `opportunity-compare-1` from `€14,673` (`98.0%` OT) to `€12,010` (`94.8%` OT) and `panel-compare-1` from `€20,105` to `€19,735` (`-€3,032` combined).
+  3. `stage4-v11` (changing `centeredLogKm` `105 -> 155` without refitting `PLACE_ALPHA` + raising outage LLR `3.6 -> 4.55..5.35` + `1.395` prior): dropped `paired-variant-1` (`€10,704`) and `opportunity-compare-1` (`€12,989`) by `-€3,400` combined vs `7906254`.
+
+
 
 
 
