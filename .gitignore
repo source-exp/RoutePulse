@@ -20,3 +20,4 @@ coverage/
 # Local agent notes
 AGENTS.md
 POSSIBLE_IMPROVEMENTS.md
+audit-*.md
