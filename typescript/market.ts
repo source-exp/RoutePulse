@@ -284,7 +284,7 @@ export class PricingEngine {
       0.28 * isFri +
       0.55 * isSat +
       (request.legs.length === 1 && plan.privateDeliveryCount > 0 ? 0.60 : 0) +
-      (request.legs.length === 2 ? 1.15 + (plan.totalRoadKm >= 220 ? 0.45 : 0) : 0) +
+      (request.legs.length === 2 ? 0.60 + (plan.totalRoadKm >= 220 ? 0.40 : 0) : 0) +
       (plan.needsChargingAny ? 0.50 : 0) +
       (plan.snowOverlap ? 0.38 : 0) +
       (isFluSameDay ? 0.32 : isFluShortageRollover ? 0.12 : 0) +
@@ -355,7 +355,7 @@ export class PricingEngine {
     if (plan.totalRoadKm > 260) feeMult += D_pool30 >= hubPoolThreshold ? 0.02 : 0.06
     if (plan.privatePickupCount > 0 && request.legs.length === 1) feeMult += 0.15
     if (plan.privateDeliveryCount > 0 && request.legs.length === 1) feeMult += 0.17
-    if (request.legs.length === 2) feeMult += 0.26
+    if (request.legs.length === 2) feeMult += 0.20
     if (plan.premiumAny) feeMult += 0.19
     if (plan.needsChargingAny) feeMult += 0.08
     if (plan.needsPlatesAny || plan.manualRequired) feeMult += 0.04

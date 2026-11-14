@@ -287,10 +287,11 @@ export class CompetitorMarketEstimator {
         this.monImpliedLog = monImp
         if (Math.exp(monImp) < 1.16) {
           this.priceWarUsedThisWeek = true
-          this.worldLogMean = Math.min(this.maxWorldLog, Math.max(this.minWorldLog, monImp - Math.log(0.80)))
+          const impliedNormal = Math.min(this.maxWorldLog, Math.max(this.minWorldLog, monImp - Math.log(0.80)))
+          this.worldLogMean = 0.65 * this.dayStartWorldLogMean + 0.35 * impliedNormal
         } else {
           this.worldLogMean = Math.min(this.maxWorldLog, Math.max(this.minWorldLog, monImp - Math.log(0.80)))
-          this.worldPrecision = 380
+          this.worldPrecision = 300
         }
       }
     } else if (this.priceWarToday) {
@@ -301,7 +302,7 @@ export class CompetitorMarketEstimator {
       this.currentDay <= 3 &&
       !this.priceWarUsedThisWeek &&
       this.todayQuotes >= 20 &&
-      this.todayFullPwLLR >= 7.0 &&
+      this.todayFullPwLLR >= 5.0 &&
       this.todaySumResStart / this.todayQuotes <= -0.15
     ) {
       this.priceWarUsedThisWeek = true
@@ -315,7 +316,7 @@ export class CompetitorMarketEstimator {
       const endSt = this.regionOutStats.get(this.outageCenterToday)
       const endMeanIn = endSt ? endSt.sumResIn / Math.max(1, endSt.nIn) : 0
       const endMeanOut = endSt && endSt.nOut >= 5 ? endSt.sumResOut / endSt.nOut : 0
-      if (endSt && endSt.nIn >= 14 && endSt.llr >= 10.0 && endMeanIn - endMeanOut >= 0.22) {
+      if (endSt && endSt.nIn >= 14 && endSt.llr >= 8.5 && endMeanIn - endMeanOut >= 0.22) {
         this.outageUsedThisWeek = true
       }
     }
@@ -378,10 +379,11 @@ export class CompetitorMarketEstimator {
     const zKm = centeredLogKm(params.legRoadKms)
     const d = this.getDealer(params.dealerId)
     const eventLog = this.activeEventLog(inHours, params.pickupId)
+    const effDayOffset = eventLog > 0 ? Math.max(-0.03, this.dayLogOffset) : this.dayLogOffset
 
     const logC =
       this.worldLogMean +
-      this.dayLogOffset +
+      effDayOffset +
       this.distanceSlope * zKm +
       eventLog +
       logLaneFactor(params.pickupId, params.deliveryId, params.legRoadKms, params.refFeeCents, ulpNext) +
@@ -410,7 +412,13 @@ export class CompetitorMarketEstimator {
     const meanResStart = this.todaySumResStart / this.todayQuotes
     const reqPwQuotes = this.currentDay === 0 ? 18 : 15
     const reqPwLLR = this.currentDay === 0 ? 4.8 : 3.8
-    if (!this.priceWarToday && this.todayQuotes >= reqPwQuotes && this.todayFullPwLLR >= reqPwLLR && meanResStart <= -0.22) {
+    if (
+      !this.priceWarToday &&
+      this.todayQuotes >= reqPwQuotes &&
+      this.todayQuotes <= 65 &&
+      this.todayFullPwLLR >= reqPwLLR &&
+      meanResStart <= -0.22
+    ) {
       this.priceWarToday = true
       this.outageCenterToday = null
       this.replayNonEventQuotes()
@@ -562,7 +570,7 @@ export class CompetitorMarketEstimator {
             Math.max(this.minWorldLog, 0.5 * (this.monImpliedLog + tueImp)),
           )
         }
-        this.dayStartWorldPrecision = 900
+        this.dayStartWorldPrecision = 350
         this.replayNonEventQuotes()
       }
 

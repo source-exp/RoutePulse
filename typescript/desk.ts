@@ -1846,6 +1846,10 @@ export class Desk {
       const curDay = dayOf(this.now)
       const curTod = this.now % DAY
       const curDayStart = curDay * DAY
+      const summerWithUpcomingSnow = Boolean(
+        notes[0]?.summerTyres &&
+          this.snow.overlaps(leg0.pickup.placeId, leg0.delivery.placeId, this.now, order.deadline),
+      )
       if (
         curDay < 5 &&
         curTod >= 8 * HOUR &&
@@ -1853,6 +1857,7 @@ export class Desk {
         !leg0.car.premium &&
         !leg0.pickup.privateAddress &&
         !leg0.delivery.privateAddress &&
+        !summerWithUpcomingSnow &&
         (notes[0]?.releasedAt ?? 0) <= this.now &&
         built.effectiveLastPickupAt - this.now >= 480
       ) {
@@ -2074,6 +2079,28 @@ export class Desk {
       if (!g.isBundledTwoOrder && g.stops[0]) {
         const ord = this.orders.get(g.stops[0].orderId)
         if (!ord) continue
+
+        const firstStopLeg = ord.legs[g.stops[0].leg]
+        const ordNotes = this.getNotes(ord.id)
+        if (inAwakeHours && ordNotes[0]?.summerTyres && firstStopLeg) {
+          const lastOrdLeg = ord.legs[ord.legs.length - 1]!
+          const driveMin = this.map.roadMinutes(firstStopLeg.pickup.placeId, lastOrdLeg.delivery.placeId)
+          const activeSw = this.snow.overlaps(
+            firstStopLeg.pickup.placeId,
+            lastOrdLeg.delivery.placeId,
+            this.now,
+            this.now + driveMin + 45,
+          )
+          const curFrom = g.stops[0].window?.from ?? firstStopLeg.pickup.window.from
+          if (activeSw && curFrom < activeSw.to && activeSw.to < ord.deadline - driveMin) {
+            const legs = g.stops.filter((s) => s.kind === "pickup" && s.orderId === ord.id).map((s) => s.leg)
+            g.status = "withdrawn"
+            this.unlinkGig(g.id)
+            this.outbox.push({ type: "withdraw", gigId: g.id })
+            if (legs.length > 0) this.dispatchOrderLegs(ord, legs, false)
+            continue
+          }
+        }
 
         if (this.isZombieCandidate(g, ord) && this.now > ord.lastPickupAt) {
           g.status = "withdrawn"
