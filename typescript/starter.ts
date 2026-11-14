@@ -25,6 +25,7 @@ import {
   MapGraph,
   PLATES_MINUTES,
   SnowTracker,
+  visitAt,
 } from "./planner.ts"
 import type { BuiltOrderStops, RetryState } from "./planner.ts"
 import { PricingEngine, RosterSupplyModel } from "./market.ts"
@@ -52,6 +53,7 @@ const WAKE_ON: DeskEventKind[] = [
   "no_show",
   "driver_late",
   "offer_answered",
+  "delivered",
   "release",
   "forecast",
 ]
@@ -69,7 +71,9 @@ type GigState = {
   isBundledTwoOrder: boolean
   splitAt: number
   urgentEscalated: boolean
+  urgentEscalatedAt: number | null
   pastDeadlineEscalated: boolean
+  zombieCleared: boolean
   offerWave: number
   nextOfferCheckAt: number
 }
@@ -476,7 +480,9 @@ class Desk {
         isBundledTwoOrder: distinctOrders.size > 1,
         splitAt: gig.postedAt + 120,
         urgentEscalated: gig.stops.some((s) => this.urgent.has(s.orderId)),
+        urgentEscalatedAt: gig.stops.some((s) => this.urgent.has(s.orderId)) ? snapshot.now : null,
         pastDeadlineEscalated: false,
+        zombieCleared: gig.postedAt > snapshot.now,
         offerWave: 0,
         nextOfferCheckAt: snapshot.now + 30,
       }
@@ -635,10 +641,24 @@ class Desk {
     this.stripWindowsOrders.delete(order.id)
     this.pairingBufferUntil.delete(order.id)
 
+    const notes = this.getNotes(order.id)
     for (let l = 0; l < order.legs.length; l++) {
       if (order.legs[l]!.pickup.window.from !== prev.legs[l]?.pickup.window.from) {
         const r = this.getLegRetry(order.id, l)
         if (r.pickupFrom > 0) this.setLegRetry(order.id, l, { ...r, pickupFrom: 0 })
+      }
+      // Sync cached delivery hours if order_changed rerouted destination town!
+      if (notes[l] && order.legs[l]!.delivery.placeId !== prev.legs[l]?.delivery.placeId) {
+        notes[l]!.deliveryHours = order.legs[l]!.delivery.hours
+          ? {
+              opens: order.legs[l]!.delivery.hours!.opens,
+              closes: order.legs[l]!.delivery.hours!.closes,
+              weekdays: [...order.legs[l]!.delivery.hours!.weekdays],
+              saturday: order.legs[l]!.delivery.hours!.saturday
+                ? { ...order.legs[l]!.delivery.hours!.saturday! }
+                : null,
+            }
+          : null
       }
     }
 
@@ -830,10 +850,12 @@ class Desk {
     const snowSlow = this.snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, pickupAt, pickupAt + drive * 2) ? 1.30 : 1.08
     const predArrival = pickupAt + 15 + extra + Math.ceil(drive * snowSlow)
     const effDl = Math.min(order.deadline, notes[notes.length - 1]?.noteDeadline ?? Infinity)
+    const realDelivHours = notes[notes.length - 1]?.deliveryHours ?? leg.delivery.hours
+    const missesDelivery = !Number.isFinite(visitAt(predArrival, effDl, realDelivHours, 10))
     const effLpa = this.effectiveLastPickupByOrder.get(order.id) ?? order.lastPickupAt
     const Q30 = this.supply.pool30(leg.pickup.placeId, g.audience.experienced, g.audience.manualLicence)
 
-    if (violatesRealPickupClose || (predArrival > effDl && effLpa - this.now >= 95 && Q30 >= 4)) {
+    if (violatesRealPickupClose || (missesDelivery && effLpa - this.now >= 95 && Q30 >= 4)) {
       g.status = "withdrawn"
       this.unlinkGig(gigId)
       this.urgent.add(order.id)
@@ -853,8 +875,9 @@ class Desk {
     if (!hadActiveLink) return
 
     for (const order of this.distinctLiveOrdersOfStops(g.stops)) {
-      this.doNotBundle.add(order.id)
       const missing = undeliveredLegs(order).filter((l) => !this.legGigs.get(order.id)?.has(l))
+      const effLpa = this.effectiveLastPickupByOrder.get(order.id) ?? order.lastPickupAt
+      if (effLpa - this.now < 420) this.doNotBundle.add(order.id)
       if (missing.length > 0) this.dispatchOrderLegs(order, missing, false)
     }
   }
@@ -920,6 +943,7 @@ class Desk {
     const g = this.gigs.get(gigId)
     this.offers.recordDelivered(g?.driverId ?? null, placeId, at)
     this.legGigs.get(orderId)?.delete(leg)
+    this.needsImmediateOfferPass = true
 
     const order = this.orders.get(orderId)
     if (order) order.deliveredAt[leg] = at
@@ -966,11 +990,24 @@ class Desk {
       if (g.isBundledTwoOrder) {
         this.splitOpenBundle(g)
       } else {
+        const isPastDl = this.now > order.deadline
+        // Same-day no-reset guard: do not overwrite an already-climbing urgent schedule back down to Step 0 when deadline_close fires!
+        if (
+          g.urgentEscalated &&
+          g.urgentEscalatedAt !== null &&
+          this.now - g.urgentEscalatedAt <= 6 * HOUR &&
+          !(isPastDl && !g.pastDeadlineEscalated)
+        ) {
+          g.offerWave++
+          this.queueOffersForSingleGig(g, 3)
+          continue
+        }
         const legs = g.stops.filter((s) => s.kind === "pickup" && s.orderId === order.id).map((s) => s.leg)
         const sched = this.computeSingleSchedule(order, legs)
         g.schedule = sched
         g.urgentEscalated = true
-        g.pastDeadlineEscalated = this.now > order.deadline
+        g.urgentEscalatedAt = this.now
+        g.pastDeadlineEscalated = isPastDl
         g.offerWave++
         this.outbox.push({ type: "reprice", gigId: g.id, schedule: sched })
         this.queueOffersForSingleGig(g, 3)
@@ -1024,14 +1061,7 @@ class Desk {
       this.snow.overlaps(firstLeg.pickup.placeId, lastLeg.delivery.placeId, earliestPickupAt, order.deadline),
     )
     const dealer = this.pricing.estimator.getDealer(order.dealerId)
-    const highTrust =
-      this.level === 8 &&
-      this.now < 4 * DAY + 17 * HOUR &&
-      (dealer.trust >= 4 ||
-        order.dealerId === "D01" ||
-        order.dealerId === "D02" ||
-        order.dealerId === "D03" ||
-        order.dealerId === "D04")
+    const highTrust = this.level === 8 && dealer.trust >= 6
     const isPastDeadline = this.now > order.deadline
     const isUrgent =
       isPastDeadline ||
@@ -1256,9 +1286,13 @@ class Desk {
         }
       }
 
-      // Hold high-slack standard D2D orders in a fast 22-minute pairing buffer!
+      // Hold high-slack standard D2D orders in a fast 22-minute pairing buffer during active weekday request hours!
       const leg0 = order.legs[0]!
+      const curDay = Math.floor(this.now / DAY)
+      const curTod = this.now % DAY
       if (
+        curDay < 5 &&
+        curTod <= 17 * HOUR + 40 &&
         !leg0.car.premium &&
         !leg0.pickup.privateAddress &&
         !leg0.delivery.privateAddress &&
@@ -1461,6 +1495,24 @@ class Desk {
       if (!g.isBundledTwoOrder && g.stops[0]) {
         const ord = this.orders.get(g.stops[0].orderId)
         if (!ord) continue
+
+        // Zombie-gig cleanup at lastPickupAt + 1: once lastPickupAt passes on a gig posted <= lastPickupAt,
+        // no driver can reach the deadline window anymore, yet gig_expired won't fire until 20:01!
+        // Withdraw & repost immediately without stop windows so drivers can book right away (<2h 10% late instead of 50% next-week)!
+        const hasPrivPick = ord.legs.some((l) => l.pickup.privateAddress)
+        if (!hasPrivPick && !g.zombieCleared && g.postedAt <= ord.lastPickupAt && this.now > ord.lastPickupAt) {
+          g.status = "withdrawn"
+          g.zombieCleared = true
+          this.unlinkGig(g.id)
+          this.outbox.push({ type: "withdraw", gigId: g.id })
+          this.stripWindowsOrders.add(ord.id)
+          this.urgent.add(ord.id)
+          this.doNotBundle.add(ord.id)
+          const missing = undeliveredLegs(ord).filter((l) => !this.legGigs.get(ord.id)?.has(l))
+          if (missing.length > 0) this.dispatchOrderLegs(ord, missing, false)
+          continue
+        }
+
         if (!g.pastDeadlineEscalated && this.now > ord.deadline + 30) {
           this.escalateOrderUrgent(ord)
           continue
@@ -1509,6 +1561,10 @@ class Desk {
       if (!g.isBundledTwoOrder && g.stops[0]) {
         const ord = this.orders.get(g.stops[0].orderId)
         if (!ord) continue
+        if (!g.zombieCleared && g.postedAt <= ord.lastPickupAt && !ord.legs.some((l) => l.pickup.privateAddress)) {
+          const zombieAt = ord.lastPickupAt + 1
+          if (zombieAt > this.now) next = Math.min(next, zombieAt)
+        }
         if (!g.pastDeadlineEscalated) {
           const rescueAt = ord.deadline + 31
           if (rescueAt > this.now) next = Math.min(next, rescueAt)
@@ -1561,7 +1617,9 @@ class Desk {
             isBundledTwoOrder: meta?.isBundledTwoOrder ?? false,
             splitAt: meta?.splitAt ?? Infinity,
             urgentEscalated: meta?.urgentEscalated ?? false,
+            urgentEscalatedAt: meta?.urgentEscalated ? this.now : null,
             pastDeadlineEscalated: meta?.pastDeadlineEscalated ?? false,
+            zombieCleared: false,
             offerWave: 0,
             nextOfferCheckAt: this.now,
           }

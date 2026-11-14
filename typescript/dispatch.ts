@@ -68,9 +68,9 @@ export function buildSingleGigSchedule(
     ctx.withCharging ||
     ctx.withPlates
 
-  let m0 = ctx.highTrustDealer || ctx.routeKm > 220 ? 0.89 : 0.82
-  if (D_home >= 80 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !ctx.fluActive && ctx.routeKm <= 200) {
-    m0 -= 0.04 // 0.78x..0.85x on dense hub->hub where returning/local drivers abound
+  let m0 = 0.85
+  if (D_home >= 80 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !ctx.fluActive && ctx.routeKm <= 220) {
+    m0 -= 0.04 // 0.81x on dense hub->hub where returning/local drivers abound
   }
   if (D_home <= 5 && !sameCluster30) m0 += 0.08
   else if (D_home <= 12 && !sameCluster30) m0 += 0.05
@@ -79,7 +79,8 @@ export function buildSingleGigSchedule(
   else if (Q30 <= 5) m0 += 0.07
   else if (Q30 <= 15) m0 += 0.03
 
-  if (ctx.routeKm > 280) m0 += 0.06
+  if (ctx.routeKm > 260) m0 += 0.07
+  if (ctx.routeKm > 400) m0 += 0.06
   if (ctx.hasPrivatePickup && !ctx.isTradeInTwoLegs) m0 += 0.14
   if (ctx.hasPrivateDelivery && !ctx.isTradeInTwoLegs) m0 += 0.16
   if (ctx.isTradeInTwoLegs) m0 += 0.14
@@ -90,7 +91,7 @@ export function buildSingleGigSchedule(
   if (ctx.snowOverlap) m0 += 0.12
   if (ctx.fluActive) m0 += 0.10
 
-  m0 = Math.max(0.77, Math.min(1.34, m0))
+  m0 = Math.max(0.80, Math.min(1.32, m0))
 
   if (ctx.level === 1) {
     const flatMult = ctx.isPastDeadline ? 2.20 : ctx.urgent ? Math.max(1.48, m0 + 0.35) : m0
@@ -143,37 +144,43 @@ export function buildSingleGigSchedule(
     { at: ctx.now, mult: m0 },
   ]
 
-  // On long-haul (>250km) or low-destination-supply routes crossing overnight, step up gently at 06:40
-  // so full-day drivers claim the long trip before booking shorter morning gigs!
-  if (crossesNight && isLongOrDeadEnd) {
-    const morningWaveAt = Math.max(ctx.now + 90, lpaDayStart + 6 * HOUR + 40)
-    if (morningWaveAt < lpa - 260) {
+  // On ultra-long (>400km, e.g. Oulu/Kemi) overnight hauls, step gently 9h before lastPickupAt so evening train drivers book!
+  if (crossesNight && ctx.routeKm > 400) {
+    const eveTrainAt = Math.max(ctx.now + 75, ctx.earliestPickupAt - 360, lpa - 540)
+    if (eveTrainAt < lpaDayStart + 6 * HOUR + 20) {
       rampOffsets.push({
-        at: morningWaveAt,
-        mult: Math.max(m0 + 0.12, 1.04),
+        at: eveTrainAt,
+        mult: Math.max(m0 + 0.08, 1.04),
       })
     }
   }
 
-  const minRampStart = crossesNight
-    ? Math.max(ctx.now + 120, lpaDayStart + (isLongOrDeadEnd ? 7 * HOUR + 45 : 8 * HOUR + 45))
-    : ctx.now + 80
+  // On long-haul (>250km) or low-destination-supply routes crossing overnight, step up gently at 06:40
+  // so full-day drivers claim the long trip before booking shorter morning gigs!
+  if (crossesNight && isLongOrDeadEnd) {
+    const morningWaveAt = Math.max(ctx.now + 90, ctx.earliestPickupAt - 60, lpaDayStart + 6 * HOUR + 40)
+    if (morningWaveAt < lpa - 260) {
+      rampOffsets.push({
+        at: morningWaveAt,
+        mult: Math.max(m0 + 0.12, 1.08),
+      })
+    }
+  }
 
-  const anchors: Array<{ beforeLpa: number; add: number; floor: number }> = ctx.highTrustDealer
-    ? [
-        { beforeLpa: 390, add: 0.13, floor: 1.05 },
-        { beforeLpa: 295, add: 0.27, floor: 1.20 },
-        { beforeLpa: 205, add: 0.45, floor: 1.40 },
-        { beforeLpa: 130, add: 0.68, floor: 1.68 },
-        { beforeLpa: 70, add: 0.98, floor: 2.02 },
-      ]
-    : [
-        { beforeLpa: 360, add: 0.11, floor: 0.98 },
-        { beforeLpa: 265, add: 0.23, floor: 1.12 },
-        { beforeLpa: 185, add: 0.39, floor: 1.30 },
-        { beforeLpa: 115, add: 0.60, floor: 1.56 },
-        { beforeLpa: 60, add: 0.88, floor: 1.88 },
-      ]
+  const minRampStart = Math.max(
+    ctx.earliestPickupAt,
+    crossesNight
+      ? Math.max(ctx.now + 120, lpaDayStart + (isLongOrDeadEnd ? 7 * HOUR + 45 : 8 * HOUR + 45))
+      : ctx.now + 80,
+  )
+
+  const anchors: Array<{ beforeLpa: number; add: number; floor: number }> = [
+    { beforeLpa: 360, add: 0.11, floor: 0.98 },
+    { beforeLpa: 265, add: 0.23, floor: 1.12 },
+    { beforeLpa: 185, add: 0.39, floor: 1.30 },
+    { beforeLpa: 115, add: 0.60, floor: 1.56 },
+    { beforeLpa: 60, add: 0.88, floor: 1.88 },
+  ]
 
   for (const a of anchors) {
     const t = Math.max(minRampStart, lpa - a.beforeLpa)
@@ -208,7 +215,7 @@ export type BundledGigPlan = {
   stops: StopRef[]
   audience: Audience
   schedule: FeeStep[]
-  tier: 1 | 2 | 3
+  tier: 1 | 2
   splitAt: number
 }
 
@@ -315,12 +322,12 @@ function evaluateOrderedBundle(
   const refSum = a.request.referenceFeeCents + b.request.referenceFeeCents
   const refMax = Math.max(a.request.referenceFeeCents, b.request.referenceFeeCents)
   const mktMult = 1.0 + (snow1 || snow2 ? 0.10 : 0) + (fluActive ? 0.08 : 0)
-  const coeffs = tier === 1 ? [0.55, 0.63, 0.72, 0.83] : [0.62, 0.70, 0.79, 0.90]
+  const coeffs = tier === 1 ? [0.58, 0.66, 0.75, 0.85] : [0.66, 0.74, 0.83, 0.93]
 
   const schedule = normalizeSteps(
     coeffs.map((c, k) => ({
       at: now + k * 30,
-      feeCents: Math.round(Math.max(c * refSum, (0.85 + 0.08 * k) * refMax) * mktMult),
+      feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),
     })),
     now,
   )
@@ -462,11 +469,11 @@ export function tryExtendTwoToThreeOrderBundle(
   const refSum = entries.reduce((s, e) => s + e.request.referenceFeeCents, 0)
   const refMax = Math.max(...entries.map((e) => e.request.referenceFeeCents))
   const mktMult = 1.0 + (fluActive ? 0.08 : 0)
-  const coeffs = [0.50, 0.58, 0.67, 0.77]
+  const coeffs = [0.52, 0.60, 0.69, 0.79]
   const schedule = normalizeSteps(
     coeffs.map((kMult, k) => ({
       at: now + k * 30,
-      feeCents: Math.round(Math.max(kMult * refSum, (1.00 + 0.08 * k) * refMax) * mktMult),
+      feeCents: Math.round(Math.max(kMult * refSum, (1.02 + 0.08 * k) * refMax) * mktMult),
     })),
     now,
   )
@@ -684,19 +691,23 @@ export class DirectOfferTracker {
         }
       }
 
-      // Only send offers to proven-active drivers today (or urgent/rescue candidates active within 8h)
-      const maxInactiveMins = gig.isPastDeadline || (isUrgent && slackMin <= 150) ? 480 : 180
+      // Only send offers to drivers seen active today
+      const maxInactiveMins = 540
       if (!workedToday && !chained && minsSinceAct > maxInactiveMins) continue
 
       const distP = map.distKm(d.homePlaceId, gig.pickupPlaceId)
       const distD = map.distKm(d.homePlaceId, gig.deliveryPlaceId)
       if (!chained && distP > 65 && distD > 30) continue
 
+      // Ensure non-chained home-origin drivers can actually reach pickup before effectiveLastPickupAt!
+      const transitMin = chained ? 0 : Math.ceil(map.roadMinutes(d.homePlaceId, gig.pickupPlaceId) * 1.25)
+      if (!chained && now + transitMin + 15 > gig.effectiveLastPickupAt) continue
+
       let matchScore = -Infinity
       if (chained && distD <= 30) matchScore = 108
       else if (chained) matchScore = distP > 30 ? 92 : 76
-      else if (distD === 0 && distP > 30) matchScore = 84
-      else if (distD <= 30 && distP > 30) matchScore = 76
+      else if (distD === 0 && distP > 30) matchScore = 84 - transitMin * 0.05
+      else if (distD <= 30 && distP > 30) matchScore = 76 - transitMin * 0.05
       else if (distP > 30 && distP <= 65) matchScore = isScarce || isUrgent ? 72 : 48
       else if (distP <= 30 && distD <= 30) matchScore = 54
       else if (distP <= 30) matchScore = isUrgent || isScarce ? 64 : 40
@@ -739,10 +750,13 @@ export class DirectOfferTracker {
       }
 
       const rawFee = Math.round(gig.refFeeCents * Math.min(2.80, mult))
-      const feeCents =
+      let feeCents =
         isUrgent && slackMin <= 190
           ? Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
           : rawFee
+      if (distP <= 30 && feeCents < gig.currentAppFeeCents) {
+        feeCents = gig.currentAppFeeCents
+      }
 
       const prevDeclined = this.declinedMaxFee.get(`${gig.gigId}:${d.id}`) ?? 0
       if (feeCents <= prevDeclined + 50) continue

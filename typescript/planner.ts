@@ -301,6 +301,7 @@ export function computeOptionPlan(
     // Add 15m safety buffer before dealer closing hours so stochastic drive variance doesn't roll to next morning
     const closeBuffer = delivHours ? 15 : 0
     const latestDeliv = latestOpenBefore(delivCap, delivHours, closeBuffer)
+    const rawLatestDeliv = latestOpenBefore(delivCap, delivHours, 0)
 
     const baseDrive = map.roadMinutes(leg.pickup.placeId, leg.delivery.placeId)
     const snowLate = snow.overlaps(leg.pickup.placeId, leg.delivery.placeId, Math.max(now, latestDeliv - baseDrive * 2), latestDeliv)
@@ -312,7 +313,14 @@ export function computeOptionPlan(
       ? leg.pickup.window.to + (i > 0 ? 30 : 0)
       : effectiveDeadline
     const pickCap = Math.min(latestDeliv - effDrive - charging - plates, pickWindowCap)
-    latestNextPickup = latestOpenBefore(pickCap, pickHours, 0)
+    const rawPickCap = Math.min(rawLatestDeliv - baseDrive - charging - plates, pickWindowCap)
+    const bufferedPickup = latestOpenBefore(pickCap, pickHours, 0)
+    const rawPickup = latestOpenBefore(rawPickCap, pickHours, 0)
+    // Never let the 15m+3% clear-weather safety buffer jump 24-72h backward across a night/weekend boundary!
+    latestNextPickup =
+      !snowLate && Math.floor(bufferedPickup / DAY) < Math.floor(rawPickup / DAY)
+        ? rawPickup
+        : bufferedPickup
   }
 
   if (!Number.isFinite(latestNextPickup) || latestNextPickup < earliestPickupAt - 5 || latestNextPickup <= now + 20) {
