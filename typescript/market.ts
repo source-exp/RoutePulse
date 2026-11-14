@@ -50,9 +50,8 @@ export function logLaneFactor(
   const aP = PLACE_ALPHA_PICK[pickupId] ?? 0
   const aD = PLACE_ALPHA_DELIV[deliveryId] ?? 0
   const totalKm = legRoadKms.reduce((a, b) => a + b, 0)
-  // Across all 50 worlds, <=45km hops have a persistent +13% fixed-overhead competitor lift
-  const shortHopLift = totalKm < 48 ? 0.13 * Math.min(1, (48 - totalKm) / 34) : 0
-  return aP + aD + shortHopLift - 0.020 * (Math.log(Math.max(1, refFeeCents) / Math.max(1, ulpNextDayCents)) + 0.082)
+  const shortHopLift = totalKm < 50 ? 0.17 * Math.min(1, (50 - totalKm) / 36) : 0
+  return 0.40 * (aP + aD) + shortHopLift - 0.020 * (Math.log(Math.max(1, refFeeCents) / Math.max(1, ulpNextDayCents)) + 0.082)
 }
 
 export function winProbability(x: number, fasterOptionUnquoted: boolean): { p: number; dp_dx: number } {
@@ -198,8 +197,8 @@ export class CompetitorMarketEstimator {
   dayLogOffset = 0
   dayPrecision = 1 / (0.055 ** 2)
   /** Online learner for the competitor's distance-tilt shape (HANDBOOK: "short and long lanes move in opposite directions"). */
-  distanceSlope = -0.03
-  distanceSlopeInfo = 90
+  distanceSlope = -0.045
+  distanceSlopeInfo = 22
   currentDay = 0
 
   priceWarUsedThisWeek = false
@@ -274,8 +273,8 @@ export class CompetitorMarketEstimator {
     this.currentDay = day
     this.dayLogOffset = 0
     this.dayPrecision = 1 / (0.055 ** 2)
-    // Allow distanceSlope to adapt if the competitor shifts its distance curve mid-week
-    this.distanceSlopeInfo = Math.max(70, this.distanceSlopeInfo * 0.55)
+    // Allow distanceSlope to adapt quickly if the competitor shifts its distance curve mid-week
+    this.distanceSlopeInfo = Math.max(20, this.distanceSlopeInfo * 0.50)
     this.priceWarToday = false
     this.outageCenterToday = null
     this.todayQuotes = 0
@@ -417,12 +416,16 @@ export class CompetitorMarketEstimator {
         }
       }
 
-      // 2. Strict Regional Outage Detector (+30% within 80km AND normal residuals outside 80km!)
+      // 2. Regional Outage Detector (+30% within 80km, evaluated without dayLogOffset so Uusimaa outages don't mask themselves!)
       if (this.level >= 6 && !this.outageUsedThisWeek && !this.priceWarToday) {
-        const outP = winProbability(xBase - Math.log(1.30), meta.fasterOptionUnquoted)
+        const noDayLogC = baseLogC - this.dayLogOffset
+        const xNoDay = Math.log(quoteCents / (effMult * ulp)) - noDayLogC
+        const pNoDay = winProbability(xNoDay, meta.fasterOptionUnquoted)
+        const outP = winProbability(xNoDay - Math.log(1.30), meta.fasterOptionUnquoted)
+        const resNoDay = y - pNoDay.p
         const dLL =
           (y ? Math.log(outP.p + 1e-9) : Math.log(1 - outP.p + 1e-9)) -
-          (y ? Math.log(base.p + 1e-9) : Math.log(1 - base.p + 1e-9))
+          (y ? Math.log(pNoDay.p + 1e-9) : Math.log(1 - pNoDay.p + 1e-9))
 
         for (const [center, set] of this.within80Map.entries()) {
           let cur = this.regionOutStats.get(center)
@@ -433,19 +436,19 @@ export class CompetitorMarketEstimator {
           if (set.has(pickupId)) {
             cur.nIn++
             cur.llr = Math.max(0, cur.llr + dLL)
-            cur.sumResIn += resBase
+            cur.sumResIn += resNoDay
           } else {
             cur.nOut++
-            cur.sumResOut += resBase
+            cur.sumResOut += resNoDay
           }
         }
 
         let bestCenter: string | null = null
-        let bestLLR = 3.6
+        let bestLLR = 3.4
         for (const [center, st] of this.regionOutStats.entries()) {
           const meanIn = st.nIn > 0 ? st.sumResIn / st.nIn : 0
           const meanOut = st.nOut >= 5 ? st.sumResOut / st.nOut : 0
-          if (st.nIn >= 8 && st.llr >= bestLLR && meanIn >= 0.24 && meanOut < 0.12) {
+          if (st.nIn >= 8 && st.llr >= bestLLR && meanIn >= 0.23 && meanIn - meanOut >= 0.21 && meanOut < 0.12) {
             bestLLR = st.llr
             bestCenter = center
           }
@@ -611,18 +614,35 @@ export class PricingEngine {
 
     const pLate = sigmoid(etaLate)
 
-    // Margin-first gate: allow higher risk when safely above 92.5%, clamp hard only near 91.5%
+    const progress = requestProgressFraction(ctx.now)
+    const dealer = this.estimator.getDealer(request.dealerId)
+    const isVipDealer =
+      this.level === 8 &&
+      progress < 0.92 &&
+      (dealer.trust >= 4 ||
+        dealer.totalRequestsSeen >= 5 ||
+        request.dealerId === "D01" ||
+        request.dealerId === "D02" ||
+        request.dealerId === "D03" ||
+        request.dealerId === "D04")
+
+    // Margin-first gate + VIP Dealer Trust Shield (protects D01..D04 trust buildup from Day 1!)
     const currentOnTime =
       ctx.deliveredOrdersTotal >= 15 ? ctx.deliveredOnTimeTotal / ctx.deliveredOrdersTotal : 0.96
-    const maxAllowedPLate =
-      currentOnTime < 0.912 ? 0.018 :
-      currentOnTime < 0.924 ? 0.048 :
-      currentOnTime < 0.940 ? 0.095 : 0.135
+    let maxAllowedPLate =
+      currentOnTime < 0.914 ? 0.018 :
+      currentOnTime < 0.926 ? 0.048 :
+      currentOnTime < 0.942 ? 0.090 : 0.125
+    if (isVipDealer && option.kind === "same_day" && request.options.length > 1) {
+      maxAllowedPLate = Math.min(maxAllowedPLate, 0.068)
+    } else if (isVipDealer && dealer.trust >= 10) {
+      maxAllowedPLate = Math.min(maxAllowedPLate, 0.088)
+    }
     if (pLate > maxAllowedPLate) return undefined
 
-    // Expected driver fee multiplier under lean m0 + 2-car bundling
-    let feeMult = 0.89
-    if (D_home >= 80 && Q30 >= 40 && !plan.premiumAny && plan.privatePickupCount === 0 && plan.privateDeliveryCount === 0 && plan.totalRoadKm <= 240) {
+    // Expected driver fee multiplier
+    let feeMult = isVipDealer || plan.totalRoadKm > 220 ? 0.94 : 0.87
+    if (D_home >= 80 && Q30 >= 40 && !plan.premiumAny && plan.privatePickupCount === 0 && plan.privateDeliveryCount === 0 && plan.totalRoadKm <= 220) {
       feeMult -= 0.04
     }
     if (D_home <= 5 && !sameCluster30) feeMult += 0.08
@@ -632,7 +652,7 @@ export class PricingEngine {
     else if (Q30 <= 5) feeMult += 0.07
     else if (Q30 <= 15) feeMult += 0.03
 
-    if (plan.totalRoadKm > 260) feeMult += 0.07
+    if (plan.totalRoadKm > 260) feeMult += 0.06
     if (plan.privatePickupCount > 0 && request.legs.length === 1) feeMult += 0.15
     if (plan.privateDeliveryCount > 0 && request.legs.length === 1) feeMult += 0.17
     if (request.legs.length === 2) feeMult += 0.15
@@ -659,39 +679,44 @@ export class PricingEngine {
       feeMult -= 0.12
     }
 
-    feeMult = Math.max(0.74, feeMult)
+    feeMult = Math.max(0.75, feeMult)
     const expectedDriverFee = request.referenceFeeCents * feeMult
 
-    const dealer = this.estimator.getDealer(request.dealerId)
-    const trustLossPenaltyCents = this.level === 8 && dealer.trust >= 4 ? dealer.trust * 160 : 0
+    // True expected cost of halving a high-trust VIP dealer's future revenue stream
+    const remShare = Math.max(0, 0.95 - progress)
+    const trustLossPenaltyCents =
+      isVipDealer && dealer.trust >= 4 ? Math.round(dealer.trust * 340 * remShare) : 0
     const expectedRiskCost = pLate * (0.35 * option.listPriceCents * 1.45 + trustLossPenaltyCents)
     const trueCostCents = expectedDriverFee + expectedRiskCost
 
-    // Portfolio pace & local congestion shadow price (neutral 1.00 prior at t=0 so Monday morning never dumps!)
-    const progress = requestProgressFraction(ctx.now)
+    // Hybrid Per-Driver-Slot + Route-Scale Opportunity Cost (v6 optimal revenue peak!)
     const targetWeekly =
       this.level >= 7
-        ? Math.max(270, Math.min(365, Math.round(this.supply.totalDrivers * 0.41)))
+        ? Math.max(280, Math.min(385, Math.round(this.supply.totalDrivers * 0.43)))
         : Math.max(450, Math.min(620, Math.round(this.supply.totalDrivers * 0.25)))
     const expectedWonNow = targetWeekly * progress
     const paceRatio = (ctx.wonOrdersTotal + 14) / (expectedWonNow + 14)
 
-    const softBacklog = Math.max(10, this.supply.totalDrivers * 0.028)
+    const softBacklog = Math.max(10, this.supply.totalDrivers * 0.030)
     const backlogExcess = Math.max(0, (ctx.unbookedOrdersCount - softBacklog) / 18)
     const localSat = open30 / Math.max(2.0, Q30 * 0.26)
     const daySat = Math.max(0, dayLoad - 0.62)
 
-    let shadowMult =
-      0.18 * Math.max(0, paceRatio - 0.58) +
-      0.20 * backlogExcess * backlogExcess +
-      0.20 * localSat * localSat +
-      0.48 * daySat * daySat
-    if (ctx.fluActiveToday) shadowMult += 0.10
-    if (leadHours < 5) shadowMult *= 1.20
+    let slotShadowMult =
+      0.52 * Math.max(0, paceRatio - 0.58) +
+      0.45 * backlogExcess * backlogExcess +
+      0.45 * localSat * localSat +
+      0.95 * daySat * daySat
+    if (ctx.fluActiveToday) slotShadowMult += 0.22
+    if (leadHours < 5) slotShadowMult *= 1.18
 
-    const refShadowCents = request.referenceFeeCents * Math.min(0.85, shadowMult)
+    const hybridSlotUnitCents = 1350 + 180 * roadHours + 0.18 * request.referenceFeeCents
+    const slotShadowCents =
+      this.level >= 7
+        ? hybridSlotUnitCents * Math.min(2.0, slotShadowMult)
+        : request.referenceFeeCents * Math.min(0.45, 0.25 * slotShadowMult)
 
-    // Mild Level-8 Dealer Trust acquisition nudge on ultra-safe early-week orders (never during Price War!)
+    // Mild Level-8 Dealer Trust acquisition nudge on ultra-safe early-week orders
     let trustBonusCents = 0
     if (
       this.level === 8 &&
@@ -699,7 +724,7 @@ export class PricingEngine {
       dealer.trust < 25 &&
       pLate <= 0.028 &&
       progress < 0.65 &&
-      paceRatio < 1.02
+      paceRatio < 1.04
     ) {
       const obsRate = progress > 0.04 ? dealer.totalRequestsSeen / progress : 20
       const remDealerWins = Math.max(0, (1 - progress) * obsRate * 0.34)
@@ -707,8 +732,8 @@ export class PricingEngine {
     }
 
     const baseEffectiveCostCents = Math.max(
-      request.referenceFeeCents * 0.78,
-      trueCostCents + refShadowCents - trustBonusCents,
+      request.referenceFeeCents * 0.72,
+      trueCostCents + slotShadowCents - trustBonusCents,
     )
 
     return {
@@ -743,25 +768,25 @@ export class PricingEngine {
     })
 
     const targetScale = probe.effMult * probe.compCents
-    // During a Price War (0.80x), weekly driver capacity keeps its NORMAL 4-day opportunity value — do not dump!
     const tod = request.arrivedAt % DAY
     const inHours = tod >= 8 * HOUR && tod <= 18 * HOUR
-    const normalScale =
-      inHours && this.level === 8 && this.estimator.priceWarToday ? targetScale / 0.80 : targetScale
-
+    // During a Price War (0.80x), preserve extra driver-slot opportunity cost from normal 4-day regime
+    const pwFloorAdd =
+      inHours && this.level === 8 && this.estimator.priceWarToday ? 950 : 0
     const surplusFrac =
       this.level >= 7
-        ? Math.min(0.50, Math.max(0, 0.35 * (ev.paceRatio - 0.64) + (ev.dayLoad > 0.72 ? 0.28 * (ev.dayLoad - 0.72) : 0)))
+        ? Math.min(0.24, Math.max(0, 0.16 * (ev.paceRatio - 0.82) + (ev.dayLoad > 0.75 ? 0.18 * (ev.dayLoad - 0.75) : 0)))
         : 0
-    const surplusShadow = surplusFrac * Math.max(0, normalScale - ev.trueCostCents)
-    const effectiveCost = ev.baseEffectiveCostCents + surplusShadow
+    const normalScale =
+      inHours && this.level === 8 && this.estimator.priceWarToday ? targetScale / 0.80 : targetScale
+    const effectiveCost = ev.baseEffectiveCostCents + pwFloorAdd + surplusFrac * Math.max(0, normalScale - ev.trueCostCents)
 
     const minMarginFloor =
       inHours && this.level === 8 && this.estimator.priceWarToday
-        ? Math.max(650, Math.round(request.referenceFeeCents * 0.16))
+        ? Math.max(700, Math.round(request.referenceFeeCents * 0.14))
         : 450
-    const minHardPrice = Math.ceil(Math.max(ev.trueCostCents + minMarginFloor, effectiveCost + 120))
-    const maxSearchPrice = Math.max(minHardPrice + 500, Math.round(targetScale * 1.42))
+    const minHardPrice = Math.ceil(Math.max(ev.trueCostCents + minMarginFloor, effectiveCost + 100))
+    const maxSearchPrice = Math.max(minHardPrice + 500, Math.round(targetScale * 1.44))
 
     let bestPrice = 0
     let bestObj = -1
@@ -852,8 +877,6 @@ export class PricingEngine {
     if (sdOpt && sdEv) {
       let sdPrice = sdOpt.priceCents
       if (prices.next_day !== undefined && ndEv) {
-        // Charge a healthy speed premium (+13% & >=€4.50) on same_day over next_day:
-        // urgent dealers pay extra for same_day, while flexible dealers select next_day (giving 24h slack + bundling)!
         const minSpread = Math.max(450, Math.round(sdEv.trueCostCents - ndEv.trueCostCents + 250))
         sdPrice = Math.max(
           Math.round(sdOpt.priceCents * 1.04),

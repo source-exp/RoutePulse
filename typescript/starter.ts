@@ -33,6 +33,7 @@ import {
   buildSingleGigSchedule,
   DirectOfferTracker,
   findBestTwoOrderBundle,
+  tryExtendTwoToThreeOrderBundle,
 } from "./dispatch.ts"
 import type { ActiveDriverCommitment, BundleOrderEntry, OfferGigTarget } from "./dispatch.ts"
 
@@ -1010,14 +1011,27 @@ class Desk {
       (sum, i) => sum + this.map.roadKm(order.legs[i]!.pickup.placeId, order.legs[i]!.delivery.placeId),
       0,
     )
-    const baseRefFeeCents = (req.referenceFeeCents * legIndices.length) / order.legs.length
+    const origKm = legIndices.reduce(
+      (sum, i) => sum + this.map.roadKm(req.legs[i]!.pickup.placeId, req.legs[i]!.delivery.placeId),
+      0,
+    )
+    const changedKmScale =
+      routeKm > origKm + 5 ? (1500 + 26 * routeKm) / Math.max(1500, 1500 + 26 * origKm) : 1.0
+    const baseRefFeeCents = ((req.referenceFeeCents * legIndices.length) / order.legs.length) * changedKmScale
     const pStop = b.stops[0]!
     const earliestPickupAt = Math.max(this.now, pStop.window?.from ?? firstLeg.pickup.window.from)
     const snowOverlap = Boolean(
       this.snow.overlaps(firstLeg.pickup.placeId, lastLeg.delivery.placeId, earliestPickupAt, order.deadline),
     )
     const dealer = this.pricing.estimator.getDealer(order.dealerId)
-    const highTrust = this.level === 8 && dealer.trust >= 6
+    const highTrust =
+      this.level === 8 &&
+      this.now < 4 * DAY + 17 * HOUR &&
+      (dealer.trust >= 4 ||
+        order.dealerId === "D01" ||
+        order.dealerId === "D02" ||
+        order.dealerId === "D03" ||
+        order.dealerId === "D04")
     const isPastDeadline = this.now > order.deadline
     const isUrgent =
       isPastDeadline ||
@@ -1094,6 +1108,51 @@ class Desk {
 
       const openCandidates: BundleOrderEntry[] = []
       const candidateGigByOrder = new Map<string, GigState>()
+
+      // 0. Check if we can extend an open 2-car bundle [A, B] into a 3-car corridor chain [A, B, target]!
+      for (const g of this.gigs.values()) {
+        if (g.status !== "open" || !g.isBundledTwoOrder || g.stops.length !== 4) continue
+        if (this.now - g.postedAt > 85) continue
+        const o1 = this.orders.get(g.stops[0]!.orderId)
+        const o2 = this.orders.get(g.stops[2]!.orderId)
+        if (!o1 || !o2 || o1.id === order.id || o2.id === order.id) continue
+        if (o1.deliveredAt[0] !== null || o2.deliveredAt[0] !== null) continue
+        const r1 = this.requests.get(o1.id)
+        const r2 = this.requests.get(o2.id)
+        if (!r1 || !r2) continue
+        const n1 = this.getNotes(o1.id)
+        const n2 = this.getNotes(o2.id)
+        const b1 = buildStopsForOrder(this.map, this.snow, o1, [0], n1, this.retries.get(o1.id) ?? new Map(), this.now, this.endsAt)
+        const b2 = buildStopsForOrder(this.map, this.snow, o2, [0], n2, this.retries.get(o2.id) ?? new Map(), this.now, this.endsAt)
+        if (b1.awaitingPrivateSlotRollover || b2.awaitingPrivateSlotRollover) continue
+        const e1: BundleOrderEntry = { order: o1, request: r1, notes: n1, built: b1, wonAt: this.orderWonAt.get(o1.id) ?? g.postedAt }
+        const e2: BundleOrderEntry = { order: o2, request: r2, notes: n2, built: b2, wonAt: this.orderWonAt.get(o2.id) ?? g.postedAt }
+        const ext =
+          tryExtendTwoToThreeOrderBundle(this.map, this.snow, this.supply, e1, e2, targetEntry, this.now, this.fluActiveToday) ??
+          tryExtendTwoToThreeOrderBundle(this.map, this.snow, this.supply, targetEntry, e1, e2, this.now, this.fluActiveToday)
+        if (ext) {
+          g.status = "withdrawn"
+          this.unlinkGig(g.id)
+          this.outbox.push({ type: "withdraw", gigId: g.id })
+          const postAction: PostAction = {
+            type: "post",
+            stops: ext.stops,
+            audience: ext.audience,
+            schedule: ext.schedule,
+          }
+          this.pendingPostMeta.set(postAction, {
+            action: postAction,
+            isBundledTwoOrder: true,
+            splitAt: ext.splitAt,
+            urgentEscalated: false,
+            pastDeadlineEscalated: false,
+            strippedFallback: false,
+          })
+          this.outbox.push(postAction)
+          this.needsImmediateOfferPass = true
+          return
+        }
+      }
 
       // 1. First include buffered unposted orders (zero withdraw needed!)
       for (const bufferedId of this.pairingBufferUntil.keys()) {
@@ -1197,7 +1256,7 @@ class Desk {
         }
       }
 
-      // Hold high-slack standard D2D orders in a 22-minute pairing buffer so incoming partners can bundle cleanly!
+      // Hold high-slack standard D2D orders in a fast 22-minute pairing buffer!
       const leg0 = order.legs[0]!
       if (
         !leg0.car.premium &&
@@ -1365,7 +1424,7 @@ class Desk {
     this.checkDayRollover()
     this.finalizePendingRevenue(this.now)
 
-    // 0. Flush expired pairing-buffer orders as solo posts
+    // 0. Flush expired pairing-buffer orders as solo open gigs (keep bundle-eligible while unbooked on board!)
     for (const [bufferedId, releaseAt] of [...this.pairingBufferUntil.entries()]) {
       if (this.now >= releaseAt || this.urgent.has(bufferedId)) {
         this.pairingBufferUntil.delete(bufferedId)
