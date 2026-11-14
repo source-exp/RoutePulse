@@ -42,6 +42,23 @@ function isCleanSoloBundleLeg(entry: BundleOrderEntry, now: number): boolean {
   return true
 }
 
+function isEligibleTwoBundleFirst(entry: BundleOrderEntry, now: number): boolean {
+  if (entry.order.legs.length !== 1) return false
+  const leg = entry.order.legs[0]!
+  if (leg.pickup.privateAddress || leg.delivery.privateAddress) return false
+  if ((entry.notes[0]?.releasedAt ?? 0) > now) return false
+  return true
+}
+
+function isEligibleTwoBundleSecond(entry: BundleOrderEntry, now: number): boolean {
+  if (entry.order.legs.length !== 1) return false
+  const leg = entry.order.legs[0]!
+  if (leg.pickup.privateAddress) return false
+  if (leg.delivery.privateAddress && leg.delivery.window.to - now < 300) return false
+  if ((entry.notes[0]?.releasedAt ?? 0) > now) return false
+  return true
+}
+
 function evaluateOrderedBundle(
   map: MapGraph,
   snow: SnowTracker,
@@ -52,12 +69,13 @@ function evaluateOrderedBundle(
   fluActive: boolean,
 ): { plan: BundledGigPlan; score: number } | undefined {
   if (a.order.id === b.order.id) return undefined
-  if (!isCleanSoloBundleLeg(a, now) || !isCleanSoloBundleLeg(b, now)) return undefined
+  if (!isEligibleTwoBundleFirst(a, now) || !isEligibleTwoBundleSecond(b, now)) return undefined
 
   const leg1 = a.order.legs[0]!
   const leg2 = b.order.legs[0]!
   const n1 = a.notes[0]
   const n2 = b.notes[0]
+  const hasPrivDeliv2 = leg2.delivery.privateAddress
 
   const P1 = leg1.pickup.placeId
   const D1 = leg1.delivery.placeId
@@ -75,12 +93,15 @@ function evaluateOrderedBundle(
 
   if (dh > 50 || totalRoad > 675) return undefined
 
+  const experienced = Boolean(a.built.audience.experienced || b.built.audience.experienced)
   const manualLicence = Boolean(a.built.audience.manualLicence || b.built.audience.manualLicence)
-  const poolP1 = supply.pool30(P1, false, manualLicence)
+  const poolP1 = supply.pool30(P1, experienced, manualLicence)
   const poolD2 = supply.pool30(D2, false, false)
 
+  if (experienced && poolP1 < 22) return undefined
+  if (hasPrivDeliv2 && poolP1 < 20) return undefined
   if (manualLicence && poolP1 < 30) return undefined
-  if (poolP1 < 6 && supply.pool65(P1, false, manualLicence) < 20) return undefined
+  if (poolP1 < 6 && supply.pool65(P1, experienced, manualLicence) < 20) return undefined
 
   let tier: 1 | 2
   if (dh <= 45 && ret <= 50) tier = 1
@@ -101,7 +122,12 @@ function evaluateOrderedBundle(
   const hD2 = n2?.deliveryHours ?? leg2.delivery.hours
 
   const effDl1 = Math.min(a.order.deadline, n1?.noteDeadline ?? Infinity, d1Stop.window?.to ?? Infinity)
-  const effDl2 = Math.min(b.order.deadline, n2?.noteDeadline ?? Infinity, d2Stop.window?.to ?? Infinity)
+  const effDl2 = Math.min(
+    b.order.deadline,
+    n2?.noteDeadline ?? Infinity,
+    d2Stop.window?.to ?? Infinity,
+    hasPrivDeliv2 ? leg2.delivery.window.to : Infinity,
+  )
 
   const p1From = p1Stop.window?.from ?? leg1.pickup.window.from
   const p1To = Math.min(effDl1, p1Stop.window?.to ?? a.order.deadline)
@@ -125,7 +151,8 @@ function evaluateOrderedBundle(
     curDayStart + DAY + 7 * HOUR + 15,
     curDayStart + 2 * DAY + 7 * HOUR + 15,
   ]
-  const reqPostDelivSlack = snow1 || snow2 ? 220 : 175
+  const reqPostDelivSlack1 = snow1 || snow2 ? 220 : 175
+  const reqPostDelivSlack2 = hasPrivDeliv2 ? 95 : reqPostDelivSlack1
   let feasibleSim = false
   for (const candStart of startCandidates) {
     if (candStart > minLastPickup - 120) continue
@@ -141,7 +168,7 @@ function evaluateOrderedBundle(
     if (!Number.isFinite(tD2)) continue
     const tFin2 = tD2 + 15
     if (dayOf(tP1) !== dayOf(tFin2)) continue
-    if (effDl1 - tFin1 < reqPostDelivSlack || effDl2 - tFin2 < reqPostDelivSlack) continue
+    if (effDl1 - tFin1 < reqPostDelivSlack1 || effDl2 - tFin2 < reqPostDelivSlack2) continue
     feasibleSim = true
     break
   }
@@ -150,11 +177,26 @@ function evaluateOrderedBundle(
   const refSum = a.request.referenceFeeCents + b.request.referenceFeeCents
   const refMax = Math.max(a.request.referenceFeeCents, b.request.referenceFeeCents)
   const fluTodayBundle = fluActive && dayOf(minLastPickup) === dayOf(now)
-  const mktMult = 1.0 + (snow1 || snow2 ? 0.10 : 0) + (fluTodayBundle ? 0.06 : 0)
-  const coeffs = tier === 1 ? [0.58, 0.66, 0.75, 0.85] : [0.66, 0.74, 0.83, 0.93]
+  const mktMult =
+    1.0 +
+    (snow1 || snow2 ? 0.10 : 0) +
+    (fluTodayBundle ? 0.06 : 0) +
+    (experienced ? 0.14 : 0) +
+    (hasPrivDeliv2 ? 0.08 : 0)
+  const deepSlackBundle = minLastPickup - now >= 480 && !experienced && !hasPrivDeliv2
+  const coeffs = deepSlackBundle
+    ? tier === 1
+      ? [0.53, 0.60, 0.69, 0.79, 0.86]
+      : [0.61, 0.68, 0.76, 0.85, 0.93]
+    : tier === 1
+      ? [0.58, 0.66, 0.75, 0.85]
+      : [0.66, 0.74, 0.83, 0.93]
 
   const crossesNightBundle = dayOf(minLastPickup) > dayOf(now) && minLastPickup - now >= 600
   const lpaDayStart = dayStartOf(minLastPickup)
+  const stepGap = deepSlackBundle ? 25 : 30
+  const refMaxBase = deepSlackBundle ? 0.84 : 0.90
+  const refMaxSlope = deepSlackBundle ? 0.07 : 0.08
 
   let prevStepAt2 = now
   const schedule = normalizeSteps(
@@ -163,12 +205,12 @@ function evaluateOrderedBundle(
         k === 0
           ? now
           : crossesNightBundle && k >= 2
-            ? Math.max(prevStepAt2 + 20, Math.max(now + k * 35, lpaDayStart + 7 * HOUR + 15 + (k - 2) * 50))
-            : Math.max(prevStepAt2 + 20, clampOutOfNight(now + k * 30, k))
+            ? Math.max(prevStepAt2 + 20, Math.max(now + k * 32, lpaDayStart + 7 * HOUR + 15 + (k - 2) * 45))
+            : Math.max(prevStepAt2 + 20, clampOutOfNight(now + k * stepGap, k))
       prevStepAt2 = rawStepAt
       return {
         at: rawStepAt,
-        feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),
+        feeCents: Math.round(Math.max(c * refSum, (refMaxBase + refMaxSlope * k) * refMax) * mktMult),
       }
     }),
     now,
@@ -177,7 +219,10 @@ function evaluateOrderedBundle(
   const splitAt = computeTwoOrderBundleSplitAt(now, minLastPickup)
   if (splitAt <= now + 35) return undefined
 
-  const maxP1ForP2 = b.built.effectiveLastPickupAt - driveDh - 15 - drive1 - extra1 - 15
+  const effLpa2 = hasPrivDeliv2
+    ? Math.min(b.built.effectiveLastPickupAt, leg2.delivery.window.to - drive2 - extra2 - 25)
+    : b.built.effectiveLastPickupAt
+  const maxP1ForP2 = effLpa2 - driveDh - 15 - drive1 - extra1 - 15
   const bundleStops = [...a.built.stops, ...b.built.stops]
   if (
     maxP1ForP2 >= Math.max(now + 45, p1From + 20) &&
@@ -191,6 +236,15 @@ function evaluateOrderedBundle(
       },
     }
   }
+  if (hasPrivDeliv2 && leg2.delivery.window.to > now + 60) {
+    bundleStops[3] = {
+      ...d2Stop,
+      window: {
+        from: leg2.delivery.window.from,
+        to: leg2.delivery.window.to + 15,
+      },
+    }
+  }
 
   const expectedSavings = refSum - schedule[0]!.feeCents
   const hubBonus = Math.min(600, poolP1 * 2) - dh * 12 - ret * 6
@@ -201,7 +255,7 @@ function evaluateOrderedBundle(
       firstOrderId: a.order.id,
       secondOrderId: b.order.id,
       stops: bundleStops,
-      audience: { experienced: false, manualLicence },
+      audience: { experienced, manualLicence },
       schedule,
       tier,
       splitAt,

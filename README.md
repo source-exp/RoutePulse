@@ -10,7 +10,7 @@ Zero runtime dependencies — runs directly on Node 22.18+ or Bun from [`src/sta
 
 ## 1. Results at Level 8
 
-Every score below is verified in [`results/`](results/) with full console logs. Across **25 official ranking weeks** and **60 unseen random practice weeks** (**85 Level-8 weeks**, ~35,000 cars), RoutePulse achieved a **100% ranked rate (`85 / 85`)** and **`0.0%` undelivered cars on every single week**.
+Every score below is verified in [`results/`](results/) with full console logs. Across **25 official ranking weeks** and **70 unseen random practice weeks** (**95 Level-8 weeks**, ~40,000 cars), RoutePulse achieved a **100% ranked rate (`95 / 95`)** and **`0.0%` undelivered cars on every single week**.
 
 ### Official Ranking Rounds (`--board`, 5 secret weeks per round)
 
@@ -30,6 +30,7 @@ Every score below is verified in [`results/`](results/) with full console logs. 
 | **Best single week (`ab19-09`)** | **+€30,056.61** | `+€28,755.90` `v16` (`+€1,300.71` on same seed; `ab16-09`: `+€26,060.73`) | **98.9%** | **0.0%** | **1 / 1** |
 | **5-seed development suite** | **€86,529.95** | `€76,930.88` early `main` (`+€9,599.07` on same 5 seeds) | **97.7%** | **0.0%** | **5 / 5** |
 | **`ab19c` unseen random weeks (10, `v19`)** | **€178,581.62** *(€89.3k / 5 wk)* | `€174,890.32` `v18` (**`+€3,691.30`**, `8W–2L` on same 10 seeds) | **97.4%** | **0.0%** | **10 / 10** |
+| **`ab20` unseen random weeks (10, `v20`)** | **€177,177.97** *(€88.6k / 5 wk)* | `€171,278.67` `v19` (**`+€5,899.30`**, `9W–1L`, $t = 3.20$ on same 10 seeds) | **97.5%** | **0.0%** | **10 / 10** |
 | **`ab16` unseen random weeks (10)** | **€176,558.53** *(€88.3k / 5 wk)* | `€167,269.11` pre-`v16` (`+€9,289.42` on same 10 seeds) | **97.8%** | **0.0%** | **10 / 10** |
 | **`ab19` unseen random weeks (10, `v18`)** | **€165,607.38** *(€82.8k / 5 wk)* | `€162,257.08` `v17` (`+€3,350.30`, `9W–1L`) & `€160,353.77` `v16` (`+€5,253.61`) | **97.7%** | **0.0%** | **10 / 10** |
 | **`oos2` unseen random weeks (10)** | **€159,316.04** *(€79.7k / 5 wk)* | `€156,495.45` pre-`v16` (`+€2,820.59` on same 10 seeds) | **97.3%** | **0.0%** | **10 / 10** |
@@ -65,7 +66,7 @@ order_won/lost ◄─ outbox.ts ◄─ market.ts (Copula menu) ◄─ estimator.
 3. **Treating Live `gig_viewed` Events as a Reveal of Who Works Today (`offers.ts`):** The driver list never shows which drivers decided to work today, and sending blind direct offers burns the 3-offers-per-driver daily limit on drivers who stayed home. RoutePulse treats recent `gig_viewed` events (`<= 20–25` minutes) as live proof that a driver has the app open right now — waking immediately on 1st-view bundle or home-return viewers (`<= 30 km` from delivery), reserving each driver's 3rd daily offer slot for high-value matches, and nudging active viewers `+3%..+13%` over the live app fee instead of raising the public board fee for everyone (which would teach all viewing drivers to wait for raises).
 
 ### Robust — Proven on unseen weeks, network drops, and mid-run restarts
-- **Unseen-week stability:** `85 / 85` Ranked (`0.0%` not delivered) across 60 unseen random Level-8 weeks and 5 official ranking rounds, spanning severe driver shortages (`< 700` drivers) to dense rosters (`930+` drivers).
+- **Unseen-week stability:** `95 / 95` Ranked (`0.0%` not delivered) across 70 unseen random Level-8 weeks and 5 official ranking rounds, spanning severe driver shortages (`< 700` drivers) to dense rosters (`930+` drivers).
 - **Tear-free restart & live-clock resilience (`starter.ts`, `rejoin.ts`, `outbox.ts`):**
   - Brackets `world.snapshot()` between `history0` and `tail` `world.events()` by sequence number (`seq`) so zero events are dropped or double-counted on a `--final` restart.
   - Reconstructs competitor beliefs, snow forecasts, dealer trust, `order_changed` shifts, and midnight-flu state via `rejoinDeskState()`.
@@ -81,10 +82,10 @@ order_won/lost ◄─ outbox.ts ◄─ market.ts (Copula menu) ◄─ estimator.
 - **Why:** Fixed markups over list price lose high-margin cars during regional outages, win unprofitable cars when a dealer retaliates, and mislearn the week's price level after a Monday price war. Independent per-option pricing also underprices `same_day` relative to `next_day`, crowding single-day driver pools.
 - **The effect (same seeds, Level 8):** Adding the Copula menu optimizer and non-event LLR replay lifted the 5-seed benchmark from **€83,723.14 (`97.4%` on time)** to **€86,529.95 (`97.7%` on time, `0.0%` not delivered)** (**`+€2,806.81`**). In `v19`, adding the outage-zone daily-offset floor, Monday-PW shrinkage blend, and balanced 2-leg trade-in pricing gained a further **`+€3,691.30` (`8W–2L`, `€174,890.32 -> €178,581.62`, on-time `96.95% -> 97.41%`)** across 10 unseen random weeks (`ab19c`).
 
-### Idea 2 — Corridor Bundling (2–3 Cars), Arriving-Driver Chaining & Night-Clamped Schedules
-- **The idea (`src/bundling.ts`, `src/dispatch.ts`, `src/offers.ts`):** Hold non-urgent weekday dealer-to-dealer orders in a slack-adaptive `22–75` minute pairing buffer to form 2-car (`dh <= 50` road min, `p2AlignedStart` simulation) and 3-car (`dh <= 32` min, `<= 440` total road min) gigs starting at **`0.56x–0.66x`** of combined typical fees, while propagating Car 2's latest pickup backward onto Car 1's pickup stop window so a driver can never collect Car 1 late and miss Car 2's closing hour. For solo gigs, open hub-to-hub lanes at **`0.81x`** typical fee, release and repost booked solo gigs when `order_changed` shrinks route distance by `> 38%` (`>= €35` savings), and clamp all fee-schedule raises out of `22:45–07:05`.
-- **Why:** At Level 8, a driver's biggest cost is unpaid public-transport deadhead to the pickup and back home. Combining two or three corridor cars eliminates mid-route public transport, while raising fees between `23:00` and `07:00` receives zero notifications and merely teaches drivers at `07:00` to wait for higher fees.
-- **The effect (same seeds, Level 8):** Upgrading from naive schedule steps and solo dispatch to waking-hour clamped schedules, Viewer-capped offers (`+3%..+13%`), and dropped-bundle retention lifted `spread-1` from **€13,613.74 (`95.9%` on time)** to **€17,069.05 (`98.5%` on time)** (**`+€3,455.31`** on the same week).
+### Idea 2 — Corridor Bundling (2–3 Cars), High-Slack Fee Discovery & Bundling-Aware Capacity
+- **The idea (`src/bundling.ts`, `src/dispatch.ts`, `src/offers.ts`, `src/market.ts`):** Hold non-urgent weekday orders (including dense-hub `premium` cars) in a slack-adaptive `22–75` minute pairing buffer to form 2-car (`dh <= 50` road min, opening at **`0.53x–0.61x`** on `>= 8h` slack) and 3-car (`dh <= 32` min, `<= 440` total road min) corridor gigs, while propagating Car 2's latest pickup backward onto Car 1's pickup stop window. On solo gigs with `>= 7h` slack in liquid hubs, open `0.045x–0.08x` below `m0` (down to **`0.72x`** typical fee) over an 88-minute early price-discovery prefix before joining the waking-hour clamped ramp, and credit `0.55` saved driver-slots per active bundle inside `market.ts`'s `paceRatio` so bundled volume never falsely triggers solo capacity throttling.
+- **Why:** Ranking-round telemetry showed `89%` of solo gigs cleared immediately on Step 0 and `paceRatio` counted bundled cars as full solo driver-slots, choking mid-week intake. Early Step-0 discovery captures willing home-return drivers cheaply with zero deadline loss, while bundling-aware `paceRatio` unlocks profitable mid-week volume.
+- **The effect (same seeds, Level 8):** Upgrading to waking-hour clamped schedules, viewer-capped offers, and dropped-bundle retention lifted `spread-1` from **€13,613.74 (`95.9%` on time)** to **€17,069.05 (`98.5%` on time, `+€3,455.31`)**; adding high-slack Step-0 discovery, `premium` 2-car bundling, and bundling-aware `paceRatio` in `v20` gained **`+€5,899.30` (`9W–1L`, $t = 3.20$, `€171,278.67 -> €177,177.97`)** across 10 unseen random weeks (`ab20`), cutting fleet `driver_fee / refFee` from `0.936x` to **`0.909x`** and lifting completed bundles from `950` to **`1,014`**.
 
 ### Idea 3 — Midnight Flu Detection, Dealer Trust Shield & Bulk-Order (`batchId`) Ranking
 - **The idea (`src/desk.ts`, `src/market.ts`):**
@@ -156,15 +157,15 @@ node --no-warnings src/reveal-csv.ts <worldId>
 | Path | Lines | Responsibility |
 |---|---:|---|
 | [`src/starter.ts`](src/starter.ts) | 304 | CLI entrypoint, `playPractice` step loop, `playFinal` 6 ms WebSocket micro-batch loop & crash recovery |
-| [`src/desk.ts`](src/desk.ts) | 2,319 | Core dispatcher state machine, `batchId` ranker, pairing buffer, snow/summer-tyre guards, urgent/rescue escalations |
-| [`src/market.ts`](src/market.ts) | 895 | Option risk & cost model (`etaLate`), dealer trust valuation, shadow pricing, Copula menu optimizer |
+| [`src/desk.ts`](src/desk.ts) | 2,336 | Core dispatcher state machine, `batchId` ranker, pairing buffer, bundle-slot accounting, snow/rescue guards |
+| [`src/market.ts`](src/market.ts) | 896 | Option risk & cost model (`etaLate`), dealer trust valuation, shadow pricing, Copula menu optimizer |
 | [`src/planner.ts`](src/planner.ts) | 750 | Road graph & 30 km / 80 km spatial indices, `SnowTracker`, 5 car-handling rules, stop window builder |
 | [`src/notes.ts`](src/notes.ts) | 653 | Validated FI / SV / EN dealer note parser (`18,031 / 18,031` ground-truth leg accuracy) |
 | [`src/estimator.ts`](src/estimator.ts) | 600 | Online Bayesian + Newton-Raphson competitor estimator, outside-anchored 80 km outage & price-war LLR detectors |
-| [`src/offers.ts`](src/offers.ts) | 435 | `DirectOfferTracker` — arriving-driver chaining, live-viewer nudges (`+3%..+13%`), quota management |
-| [`src/bundling.ts`](src/bundling.ts) | 385 | 2-car & 3-car corridor gig bundler with backward pickup-window propagation and cross-night split timers |
+| [`src/bundling.ts`](src/bundling.ts) | 439 | 2-car & 3-car corridor gig bundler (including dense-hub `premium` pairs) with backward pickup-window caps |
+| [`src/offers.ts`](src/offers.ts) | 437 | `DirectOfferTracker` — arriving-driver chaining, live-viewer nudges (`+3%..+13%`), quota management |
 | [`src/spread.ts`](src/spread.ts) | 316 | Zero-dependency HTTP + WebSocket API client with `RateLimit` token buckets (`50`-token final burst cap) |
-| [`src/dispatch.ts`](src/dispatch.ts) | 288 | Monotonic waking-hour (`07:05–22:45`) fee schedules, hub-flow discounts, Rule-4 pickup-cliff schedules |
+| [`src/dispatch.ts`](src/dispatch.ts) | 304 | Monotonic waking-hour (`07:05–22:45`) fee schedules, high-slack Step-0 price discovery (`0.72x+`), Rule-4 cliffs |
 | [`src/rejoin.ts`](src/rejoin.ts) | 206 | Tear-free state reconstruction (`rejoinDeskState`) from `snapshot` + `events` for `--final` and `--board` |
 | [`src/outbox.ts`](src/outbox.ts) | 205 | Priority-ordered `ActionOutbox` (`quote` fast-lane, cancel-before-post safety, `--final` chunking) |
 | [`src/supply.ts`](src/supply.ts) | 105 | `RosterSupplyModel` (`30 km` notification & `65 km` commuter driver pools by licence and experience) |

@@ -394,6 +394,19 @@ export class Desk {
     return count
   }
 
+  private countBundledDriverSavings(): number {
+    let savedSlots = 0
+    for (const g of this.gigs.values()) {
+      if (!g.isBundledTwoOrder || g.status === "withdrawn") continue
+      const distinctOrders = new Set<string>()
+      for (const s of g.stops) distinctOrders.add(s.orderId)
+      if (distinctOrders.size >= 2) {
+        savedSlots += 0.55 * (distinctOrders.size - 1)
+      }
+    }
+    return savedSlots
+  }
+
   private pruneUnresolvedQuotes(): void {
     for (const [reqId, meta] of this.unresolvedQuotes.entries()) {
       if (meta.request.respondBy <= this.now || this.orders.has(reqId)) {
@@ -901,7 +914,7 @@ export class Desk {
       const meta = this.pricing.quoteRequest(request, notes, {
         now: this.now,
         startMinute: this.startMinute,
-        wonOrdersTotal: this.wonOrdersTotal + pendingExpWins,
+        wonOrdersTotal: Math.max(0, this.wonOrdersTotal - this.countBundledDriverSavings()) + pendingExpWins,
         deliveredOrdersTotal: this.deliveredOrdersTotal,
         deliveredOnTimeTotal: this.deliveredOnTimeTotal,
         overdueUndeliveredCount: this.countOverdueUndeliveredOrders(),
@@ -1850,11 +1863,14 @@ export class Desk {
         notes[0]?.summerTyres &&
           this.snow.overlaps(leg0.pickup.placeId, leg0.delivery.placeId, this.now, order.deadline),
       )
+      const canBufferPremium =
+        !leg0.car.premium ||
+        this.supply.pool30(leg0.pickup.placeId, true, built.audience.manualLicence) >= 24
       if (
         curDay < 5 &&
         curTod >= 8 * HOUR &&
         curTod <= 18 * HOUR + 5 &&
-        !leg0.car.premium &&
+        canBufferPremium &&
         !leg0.pickup.privateAddress &&
         !leg0.delivery.privateAddress &&
         !summerWithUpcomingSnow &&
@@ -1862,7 +1878,7 @@ export class Desk {
         built.effectiveLastPickupAt - this.now >= 480
       ) {
         const pickFrom = built.stops[0]?.window?.from ?? leg0.pickup.window.from
-        const bufMins =
+        const rawBuf =
           pickFrom >= curDayStart + DAY
             ? Math.min(75, Math.max(32, curDayStart + 18 * HOUR + 5 - this.now))
             : built.effectiveLastPickupAt - this.now >= 1100
@@ -1870,6 +1886,7 @@ export class Desk {
               : built.effectiveLastPickupAt - this.now >= 900
                 ? 34
                 : 22
+        const bufMins = leg0.car.premium ? Math.min(rawBuf, 22) : rawBuf
         this.pairingBufferUntil.set(order.id, this.now + bufMins)
         return
       }

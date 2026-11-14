@@ -356,7 +356,7 @@ export class PricingEngine {
     if (plan.privatePickupCount > 0 && request.legs.length === 1) feeMult += 0.15
     if (plan.privateDeliveryCount > 0 && request.legs.length === 1) feeMult += 0.17
     if (request.legs.length === 2) feeMult += 0.20
-    if (plan.premiumAny) feeMult += 0.19
+    if (plan.premiumAny) feeMult += Q30 >= 22 ? 0.14 : 0.19
     if (plan.needsChargingAny) feeMult += 0.08
     if (plan.needsPlatesAny || plan.manualRequired) feeMult += 0.04
     if (isFri || isSat) feeMult += 0.07
@@ -364,6 +364,7 @@ export class PricingEngine {
     if (plan.snowOverlap) feeMult += 0.14
     if (isFluSameDay) feeMult += 0.10
     if (batchLoad > 0.65) feeMult += 0.08 * (batchLoad - 0.65)
+    if (leadHours >= 9 && Q30 >= 25 && !plan.snowOverlap && !isFluSameDay) feeMult -= 0.035
 
     const pEscalate = sigmoid(etaLate + 1.10)
     feeMult += pEscalate * 0.34
@@ -416,7 +417,7 @@ export class PricingEngine {
     const drv = this.supply.totalDrivers
     const baseTargetWeekly =
       this.level >= 7
-        ? Math.max(275, Math.min(445, Math.round(drv * (0.42 + 0.00016 * Math.max(0, drv - 690)))))
+        ? Math.max(295, Math.min(475, Math.round(drv * (0.44 + 0.00018 * Math.max(0, drv - 690)))))
         : Math.max(450, Math.min(640, Math.round(drv * 0.26)))
 
     const softBacklog = Math.max(10, drv * 0.030)

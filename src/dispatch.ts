@@ -227,8 +227,24 @@ export function buildSingleGigSchedule(
   const lpaDayStart = dayStartOf(lpa)
   const postDayStart = dayStartOf(ctx.now)
   const crossesNight = dayOf(lpa) > dayOf(ctx.now)
+  const fluToday = ctx.fluActive && dayOf(lpa) === dayOf(ctx.now)
 
-  const rampOffsets: Array<{ at: number; mult: number }> = [{ at: ctx.now, mult: m0 }]
+  const rampOffsets: Array<{ at: number; mult: number }> = []
+  if (slackMin >= 420 && Q30 >= 15 && !ctx.snowOverlap && !fluToday) {
+    const disc = slackMin >= 720 && Q30 >= 28 ? 0.08 : slackMin >= 520 && Q30 >= 20 ? 0.06 : 0.045
+    const mDisc = Math.max(0.72, m0 - disc)
+    rampOffsets.push({ at: ctx.now, mult: mDisc })
+    const tMid = clampOutOfNight(ctx.now + 42, 0)
+    if (tMid < lpa - 260) {
+      rampOffsets.push({ at: tMid, mult: Math.max(mDisc + 0.025, m0 - disc * 0.45) })
+    }
+    const tBase = clampOutOfNight(ctx.now + 88, 1)
+    if (tBase < lpa - 220) {
+      rampOffsets.push({ at: tBase, mult: m0 })
+    }
+  } else {
+    rampOffsets.push({ at: ctx.now, mult: m0 })
+  }
 
   if (crossesNight && ctx.routeKm > 400) {
     const eveTrainAt = Math.max(ctx.now + 60, postDayStart + 19 * HOUR + 15)

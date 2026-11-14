@@ -103,7 +103,9 @@ function computeOfferFeeCents(params: {
   } = params
 
   if (gig.orderIds.length > 1) {
-    const maxBundleCap = Math.round(gig.refFeeCents * (gig.orderIds.length >= 3 ? 0.68 : 0.75))
+    const baseCapRatio = gig.orderIds.length >= 3 ? 0.68 : 0.75
+    const extraRatio = (gig.audience.experienced ? 0.10 : 0) + (gig.hasPrivateStop ? 0.05 : 0)
+    const maxBundleCap = Math.round(gig.refFeeCents * (baseCapRatio + extraRatio))
     const targetBundleOffer = Math.round(
       gig.currentAppFeeCents * (chained ? 0.96 : vInfo ? 1.05 : 1.02 + gig.offerWave * 0.04),
     )
