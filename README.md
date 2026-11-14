@@ -10,7 +10,7 @@ Zero runtime dependencies — runs directly on Node 22.18+ or Bun from [`src/sta
 
 ## 1. Results at Level 8
 
-Every score below is verified in [`results/`](results/) with full console logs. Across **20 official ranking weeks** and **40 unseen random practice weeks** (**60 Level-8 weeks**, ~25,000 cars), RoutePulse achieved a **100% ranked rate** and **`0.0%` undelivered cars on every single week**.
+Every score below is verified in [`results/`](results/) with full console logs. Across **25 official ranking weeks** and **60 unseen random practice weeks** (**85 Level-8 weeks**, ~35,000 cars), RoutePulse achieved a **100% ranked rate (`85 / 85`)** and **`0.0%` undelivered cars on every single week**.
 
 ### Official Ranking Rounds (`--board`, 5 secret weeks per round)
 
@@ -18,6 +18,7 @@ Every score below is verified in [`results/`](results/) with full console logs. 
 |---|---:|---:|---:|---:|---|---|
 | **Saturday `12:00`** (Season 6) | **€95,671.45** | 2,267 | **97.9%** | **0.0%** | **5 / 5** | **`#4` final** (`#1` live at finish) |
 | **Saturday `15:00`** (Season 7) | **€92,830.32** | 2,123 | **97.6%** | **0.0%** | **5 / 5** | **`#1` live** (`+€3,382` vs `#2`) |
+| **Saturday `18:00`** (Season 8, `v19`) | **€79,828.80** | 2,107 | **98.0%** | **0.0%** | **5 / 5** | **`#2` live** of 238 teams (highest Top-12 OT) |
 | **Saturday `00:00`** (Season 4, earlier `v9`) | **€75,474.57** | 1,953 | **96.4%** | **0.0%** | **5 / 5** | `#10` of 151 teams |
 | **Saturday `09:00`** (Season 5, earlier `v14`) | **€73,949.86** | 1,935 | **97.8%** | **0.0%** | **5 / 5** | **`#4` final** |
 
@@ -26,9 +27,11 @@ Every score below is verified in [`results/`](results/) with full console logs. 
 | Evaluation Set | RoutePulse Margin | Baseline Comparison | On-Time Share | Not Delivered | Ranked |
 |---|---:|---|---:|---:|---|
 | **`spread-1` single week** | **+€17,069.05** | **−€72,612.51** for kit starter (**`+€89,681.56`** on same seed) | **98.5%** | **0.0%** | **1 / 1** |
-| **Best single week (`ab16-09`)** | **+€26,060.73** | `+€21,878.61` pre-`v16` (`+€4,182.12` on same seed) | **96.6%** | **0.0%** | **1 / 1** |
+| **Best single week (`ab19-09`)** | **+€30,056.61** | `+€28,755.90` `v16` (`+€1,300.71` on same seed; `ab16-09`: `+€26,060.73`) | **98.9%** | **0.0%** | **1 / 1** |
 | **5-seed development suite** | **€86,529.95** | `€76,930.88` early `main` (`+€9,599.07` on same 5 seeds) | **97.7%** | **0.0%** | **5 / 5** |
+| **`ab19c` unseen random weeks (10, `v19`)** | **€178,581.62** *(€89.3k / 5 wk)* | `€174,890.32` `v18` (**`+€3,691.30`**, `8W–2L` on same 10 seeds) | **97.4%** | **0.0%** | **10 / 10** |
 | **`ab16` unseen random weeks (10)** | **€176,558.53** *(€88.3k / 5 wk)* | `€167,269.11` pre-`v16` (`+€9,289.42` on same 10 seeds) | **97.8%** | **0.0%** | **10 / 10** |
+| **`ab19` unseen random weeks (10, `v18`)** | **€165,607.38** *(€82.8k / 5 wk)* | `€162,257.08` `v17` (`+€3,350.30`, `9W–1L`) & `€160,353.77` `v16` (`+€5,253.61`) | **97.7%** | **0.0%** | **10 / 10** |
 | **`oos2` unseen random weeks (10)** | **€159,316.04** *(€79.7k / 5 wk)* | `€156,495.45` pre-`v16` (`+€2,820.59` on same 10 seeds) | **97.3%** | **0.0%** | **10 / 10** |
 | **`ab18r` unseen random weeks (10)** | **€159,072.97** *(€79.5k / 5 wk)* | `€158,337.11` `v16` (`+€735.86` on same 10 seeds) | **97.1%** | **0.0%** | **10 / 10** |
 | **`ab18` unseen random weeks (10)** | **€140,001.58** *(€70.0k / 5 wk)* | `€138,637.58` `v16` (`+€1,364.00` on same 10 seeds) | **97.8%** | **0.0%** | **10 / 10** |
@@ -59,10 +62,10 @@ order_won/lost ◄─ outbox.ts ◄─ market.ts (Copula menu) ◄─ estimator.
 ### Creative — Three non-obvious insights about dealers, drivers, and the week
 1. **Common-Provider-Shock Copula for Multi-Option Menus (`market.ts`):** A dealer does not roll three independent competitors for `same_day`, `next_day`, and `within_3_days` — **one competitor** prices all options from a shared hidden world/lane/day factor. Integrating over that single shared shock $U \in [0, 1]$ stops our own options from cannibalizing each other and steers Friday-deadline cars onto Monday (`within_3_days`) where 3.5 execution days exist with zero new requests.
 2. **Midnight Flu Fingerprinting & Night-Bundle Hold (`desk.ts`, `bundling.ts`):** Drivers stay home for the flu at the start of the day (`00:00–01:30` `gig_dropped` bursts without snow), while no driver reads app notifications between `23:00` and `07:00`. Detecting midnight drop bursts immediately shifts same-day pricing and holds night-dropped multi-car gigs intact until `09:15` instead of shattering them into expensive solo gigs at `02:00` while drivers sleep.
-3. **Treating Live `gig_viewed` Events as a Reveal of Who Works Today (`offers.ts`):** The driver list never shows which drivers decided to work today, and sending blind direct offers burns the 3-offers-per-driver daily limit on drivers who stayed home. RoutePulse treats recent `gig_viewed` events (`<= 45` minutes) as live proof that a driver has the app open today, nudging repeat viewers at `+6%..+13%` over the current app fee instead of raising the public board fee for everyone (which would teach all viewing drivers to wait for raises).
+3. **Treating Live `gig_viewed` Events as a Reveal of Who Works Today (`offers.ts`):** The driver list never shows which drivers decided to work today, and sending blind direct offers burns the 3-offers-per-driver daily limit on drivers who stayed home. RoutePulse treats recent `gig_viewed` events (`<= 20–25` minutes) as live proof that a driver has the app open right now — waking immediately on 1st-view bundle or home-return viewers (`<= 30 km` from delivery), reserving each driver's 3rd daily offer slot for high-value matches, and nudging active viewers `+3%..+13%` over the live app fee instead of raising the public board fee for everyone (which would teach all viewing drivers to wait for raises).
 
 ### Robust — Proven on unseen weeks, network drops, and mid-run restarts
-- **Unseen-week stability:** `60 / 60` Ranked (`0.0%` not delivered) across 40 unseen random Level-8 weeks and 4 official ranking rounds, spanning severe driver shortages (`< 700` drivers) to dense rosters (`900+` drivers).
+- **Unseen-week stability:** `85 / 85` Ranked (`0.0%` not delivered) across 60 unseen random Level-8 weeks and 5 official ranking rounds, spanning severe driver shortages (`< 700` drivers) to dense rosters (`930+` drivers).
 - **Tear-free restart & live-clock resilience (`starter.ts`, `rejoin.ts`, `outbox.ts`):**
   - Brackets `world.snapshot()` between `history0` and `tail` `world.events()` by sequence number (`seq`) so zero events are dropped or double-counted on a `--final` restart.
   - Reconstructs competitor beliefs, snow forecasts, dealer trust, `order_changed` shifts, and midnight-flu state via `rejoinDeskState()`.
@@ -74,12 +77,12 @@ order_won/lost ◄─ outbox.ts ◄─ market.ts (Copula menu) ◄─ estimator.
 ## 3. Core Ideas: What, Why, and Measured Effect
 
 ### Idea 1 — Online Bayesian Competitor Estimator & Common-Provider-Shock Menu Pricing
-- **The idea (`src/estimator.ts`, `src/market.ts`):** Decompose the competitor's log-price relative to the **unrounded** list price (`(2000 + 25 * km) * legMult * optMult`) into fixed pickup/delivery town factors (`PLACE_ALPHA`), an online world-level mean, a daily offset, a distance-slope tilt, per-dealer retaliation/satisfaction, and log-likelihood ratio (LLR) detectors for **80 km regional outages (`+30%`)** and **level-8 price wars (`−20%`)** — replaying non-event quotes cleanly once an outage or price war is detected so our world baseline is never poisoned. Then optimize the full `(same_day, next_day, within_3_days)` price menu jointly under a shared competitor shock.
+- **The idea (`src/estimator.ts`, `src/market.ts`):** Decompose the competitor's log-price relative to the **unrounded** list price (`(2000 + 25 * km) * legMult * optMult`) into fixed pickup/delivery town factors (`PLACE_ALPHA`), an online world-level mean, a daily offset, a distance-slope tilt, per-dealer retaliation/satisfaction, and outside-anchored log-likelihood ratio (LLR) detectors for **80 km regional outages (`+30%`, with superset parsimony penalty and `effDayOffset >= -0.03` outage-zone floor)** and **morning-gated level-8 price wars (`−20%`, with `0.65 / 0.35` Monday shrinkage & Tuesday quote-16 verification)** — replaying non-event quotes cleanly once an outage or price war is detected so our world baseline is never poisoned. Then optimize the full `(same_day, next_day, within_3_days)` price menu jointly under a shared competitor shock.
 - **Why:** Fixed markups over list price lose high-margin cars during regional outages, win unprofitable cars when a dealer retaliates, and mislearn the week's price level after a Monday price war. Independent per-option pricing also underprices `same_day` relative to `next_day`, crowding single-day driver pools.
-- **The effect (same seeds, Level 8):** Adding the Copula menu optimizer, omitted-`within_3_days` elasticity fix, and non-event LLR replay lifted the 5-seed benchmark from **€83,723.14 (`97.4%` on time)** to **€86,529.95 (`97.7%` on time, `0.0%` not delivered)** (**`+€2,806.81`** across the same 5 weeks).
+- **The effect (same seeds, Level 8):** Adding the Copula menu optimizer and non-event LLR replay lifted the 5-seed benchmark from **€83,723.14 (`97.4%` on time)** to **€86,529.95 (`97.7%` on time, `0.0%` not delivered)** (**`+€2,806.81`**). In `v19`, adding the outage-zone daily-offset floor, Monday-PW shrinkage blend, and balanced 2-leg trade-in pricing gained a further **`+€3,691.30` (`8W–2L`, `€174,890.32 -> €178,581.62`, on-time `96.95% -> 97.41%`)** across 10 unseen random weeks (`ab19c`).
 
 ### Idea 2 — Corridor Bundling (2–3 Cars), Arriving-Driver Chaining & Night-Clamped Schedules
-- **The idea (`src/bundling.ts`, `src/dispatch.ts`, `src/offers.ts`):** Hold non-urgent weekday dealer-to-dealer orders in a short 22–32 minute pairing buffer to form 2-car (`dh <= 50` road min) and 3-car (`<= 640` total road min) gigs starting at **`0.55x–0.66x`** of combined typical fees, while propagating Car 2's latest pickup backward onto Car 1's pickup stop window so a driver can never collect Car 1 late and miss Car 2's closing hour. For solo gigs, open hub-to-hub lanes at **`0.81x`** typical fee, send zero-deadhead direct offers (`0.88x–0.94x`) to drivers finishing one of our gigs within 35 km, and clamp all fee-schedule raises out of `22:45–07:05`.
+- **The idea (`src/bundling.ts`, `src/dispatch.ts`, `src/offers.ts`):** Hold non-urgent weekday dealer-to-dealer orders in a slack-adaptive `22–75` minute pairing buffer to form 2-car (`dh <= 50` road min, `p2AlignedStart` simulation) and 3-car (`dh <= 32` min, `<= 440` total road min) gigs starting at **`0.56x–0.66x`** of combined typical fees, while propagating Car 2's latest pickup backward onto Car 1's pickup stop window so a driver can never collect Car 1 late and miss Car 2's closing hour. For solo gigs, open hub-to-hub lanes at **`0.81x`** typical fee, release and repost booked solo gigs when `order_changed` shrinks route distance by `> 38%` (`>= €35` savings), and clamp all fee-schedule raises out of `22:45–07:05`.
 - **Why:** At Level 8, a driver's biggest cost is unpaid public-transport deadhead to the pickup and back home. Combining two or three corridor cars eliminates mid-route public transport, while raising fees between `23:00` and `07:00` receives zero notifications and merely teaches drivers at `07:00` to wait for higher fees.
 - **The effect (same seeds, Level 8):** Upgrading from naive schedule steps and solo dispatch to waking-hour clamped schedules, Viewer-capped offers (`+3%..+13%`), and dropped-bundle retention lifted `spread-1` from **€13,613.74 (`95.9%` on time)** to **€17,069.05 (`98.5%` on time)** (**`+€3,455.31`** on the same week).
 
@@ -104,8 +107,9 @@ Every change was gated on matched multi-seed A/B tests; ideas that hurt margin o
 
 1. **Penalizing small (`< 12`-car) `batchId` groups (`-€1,796` on 5-seed benchmark):** Dealers frequently send 2–5 car mini-batches across different towns. Applying yard-depletion surcharges below 12 cars rejected profitable multi-car opportunities; restricting the yard cap to true bulk orders (`seenCount >= 12`) recovered the full margin.
 2. **Flat `€11.50` fixed per-slot shadow cost (`-€2,780` on 5-seed benchmark):** Charging every car a flat slot fee over-priced short urban hops (`85%` of €25 typical fee) while under-pricing 500 km northern trips. Replacing it with a hybrid shadow unit (`€5.20 + €1.35 * roadHours + 0.24 * referenceFee`) matched driver time consumption.
-3. **Aggressive `64h` end-of-world rescue starting Last Monday morning (`-€828` on `quant-compare-1`):** Escalating past-deadline gigs to `1.45x–2.95x` fees on Last Monday morning overpaid on cars that still had 2.5 full business days before Wednesday `22:00`. Delaying maximum rescue escalation to the final **42 hours** (Tuesday `04:00` onward) kept **`0.0%` not delivered** across all 60 weeks while saving ~€600–€900/week in late driver fees.
-4. **Naive 3-car bundling without hub/deadhead gates (`-€5,237` on 5-seed benchmark in `4ec0232`):** Greedily chaining a 3rd car onto open 2-car bundles caused `gig_expired` and late cascading failures when the 3rd leg landed in a low-driver town. Restricting 3-car extensions to `<= 35 min` link deadhead and `>= 360 min` slack made 3-car bundling strictly net-positive.
+3. **Aggressive `64h` end-of-world rescue starting Last Monday morning (`-€828` on `quant-compare-1`):** Escalating past-deadline gigs to `1.45x–2.95x` fees on Last Monday morning overpaid on cars that still had 2.5 full business days before Wednesday `22:00`. Delaying maximum rescue escalation to the final **42 hours** (Tuesday `04:00` onward) kept **`0.0%` not delivered** across all 85 weeks while saving ~€600–€900/week in late driver fees.
+4. **Naive 3-car bundling without hub/deadhead gates (`-€5,237` on 5-seed benchmark in `4ec0232`):** Greedily chaining a 3rd car onto open 2-car bundles caused `gig_expired` and late cascading failures when the 3rd leg landed in a low-driver town. Restricting 3-car extensions to `<= 32 min` link deadhead, `<= 440 min` total road time, and `>= 300 min` slack made 3-car bundling strictly net-positive.
+5. **Over-tightening bundle post-delivery slack (`175m -> 205m`) & cutting 2-leg Step-0 `m0` (`0.21 -> 0.15`) (`-€2,910.53` on `ab19` 10-seed benchmark):** Tightening clear-weather bundle slack and shortening pairing holds destroyed `104` 2-car bundles (`895 -> 791`, forcing `208` extra solo gigs onto the driver pool), while cutting Step-0 `m0` on 2-leg trade-ins raised late 2-leg orders from `3` to `14`. Keeping `v18`'s bundling slack and `m0 += 0.21` while moderating only quote-side 2-leg risk turned `-€2,911` into **`+€3,691.30` (`8W–2L`)** on `ab19c`.
 
 ---
 
@@ -152,11 +156,11 @@ node --no-warnings src/reveal-csv.ts <worldId>
 | Path | Lines | Responsibility |
 |---|---:|---|
 | [`src/starter.ts`](src/starter.ts) | 304 | CLI entrypoint, `playPractice` step loop, `playFinal` 6 ms WebSocket micro-batch loop & crash recovery |
-| [`src/desk.ts`](src/desk.ts) | 2,292 | Core dispatcher state machine, `batchId` ranker, pairing buffer, urgent/end-of-world escalations, orphan guard |
+| [`src/desk.ts`](src/desk.ts) | 2,319 | Core dispatcher state machine, `batchId` ranker, pairing buffer, snow/summer-tyre guards, urgent/rescue escalations |
 | [`src/market.ts`](src/market.ts) | 895 | Option risk & cost model (`etaLate`), dealer trust valuation, shadow pricing, Copula menu optimizer |
 | [`src/planner.ts`](src/planner.ts) | 750 | Road graph & 30 km / 80 km spatial indices, `SnowTracker`, 5 car-handling rules, stop window builder |
 | [`src/notes.ts`](src/notes.ts) | 653 | Validated FI / SV / EN dealer note parser (`18,031 / 18,031` ground-truth leg accuracy) |
-| [`src/estimator.ts`](src/estimator.ts) | 592 | Online Bayesian + Newton-Raphson competitor estimator, 80 km outage & price-war LLR detectors |
+| [`src/estimator.ts`](src/estimator.ts) | 600 | Online Bayesian + Newton-Raphson competitor estimator, outside-anchored 80 km outage & price-war LLR detectors |
 | [`src/offers.ts`](src/offers.ts) | 435 | `DirectOfferTracker` — arriving-driver chaining, live-viewer nudges (`+3%..+13%`), quota management |
 | [`src/bundling.ts`](src/bundling.ts) | 385 | 2-car & 3-car corridor gig bundler with backward pickup-window propagation and cross-night split timers |
 | [`src/spread.ts`](src/spread.ts) | 316 | Zero-dependency HTTP + WebSocket API client with `RateLimit` token buckets (`50`-token final burst cap) |
@@ -165,6 +169,7 @@ node --no-warnings src/reveal-csv.ts <worldId>
 | [`src/outbox.ts`](src/outbox.ts) | 205 | Priority-ordered `ActionOutbox` (`quote` fast-lane, cancel-before-post safety, `--final` chunking) |
 | [`src/supply.ts`](src/supply.ts) | 105 | `RosterSupplyModel` (`30 km` notification & `65 km` commuter driver pools by licence and experience) |
 | [`src/time.ts`](src/time.ts) | 83 | World-minute arithmetic and `clampOutOfNight` (`22:45–07:05` notification blackout clamp) |
+| [`src/reveal-csv.ts`](src/reveal-csv.ts) | 60 | Utility exporting an ended practice world's `reveal`, `events`, `roster`, and `map` to CSV files |
 | [`src/types.ts`](src/types.ts) | 550 | Strict TypeScript contracts matching Spread OpenAPI 3.1 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | — | Detailed formulas, state transitions, rate-limit budgets, and disruption recovery reference |
 | [`results/`](results/) | — | Complete console logs for ranking rounds, benchmark sweeps, and same-seed A/B experiments |
