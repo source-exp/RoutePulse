@@ -77,15 +77,20 @@ function startsWithProtectedAfterNeg(rest: string): boolean {
   const toks = tokenizeFolded(rest)
   const first = toks[0]
   if (!first) return false
-  if (first === "kun" || first === "fore" || first === "ready" || first === "klar") return true
-  if (
-    approxPrefix(first, "ennen") ||
-    approxPrefix(first, "before") ||
-    approxPrefix(first, "forran") ||
-    approxPrefix(first, "valmi") ||
-    approxPrefix(first, "ready")
-  ) {
+  if (first === "kun" || first === "fore") return true
+  if (approxPrefix(first, "ennen") || approxPrefix(first, "before") || approxPrefix(first, "forran")) {
     return true
+  }
+  if (first === "ready" || first === "klar" || approxPrefix(first, "valmi") || approxPrefix(first, "ready")) {
+    const second = toks[1] ?? ""
+    return (
+      second === "fore" ||
+      second === "until" ||
+      approxPrefix(second, "ennen") ||
+      approxPrefix(second, "before") ||
+      approxPrefix(second, "forran") ||
+      approxPrefix(second, "vasta")
+    )
   }
   return false
 }
@@ -94,8 +99,8 @@ function stripNegations(clause: string): string {
   let s = clause.replace(/\(\s*(?:not|no|ei|inte)\b([^)]*)\)/gi, (full, rest: string) =>
     startsWithProtectedAfterNeg(rest) ? full : " ",
   )
-  // Strip negated contrast prefix before vaan/utan/but (e.g. "ei klo 12 vaan klo 15" -> " klo 15")
-  s = s.replace(/(?:^|[,\s])\b(?:not|ei|inte)\b([^,.;!?]*?)\b(?:vaan|utan|but)\b/gi, (full, rest: string) =>
+  // Strip negated contrast prefix before vaan/utan/but (e.g. "ei klo 12, vaan klo 15" -> " klo 15")
+  s = s.replace(/(?:^|[,\s])\b(?:not|ei|inte)\b([^,.;!?]*?),?\s*\b(?:vaan|utan|but)\b/gi, (full, rest: string) =>
     startsWithProtectedAfterNeg(rest) ? full : " ",
   )
   s = s.replace(/,\s*(?:not|ei|inte)\b([^,.;!?]*)/gi, (full, rest: string) => {
@@ -184,10 +189,18 @@ function extractDay(fragment: string, arrivedAt: number): number | null {
 
   if (/\bday\s+after\s+tomorrow\b/.test(f)) return arrDay + 2
   const toks = f.match(/[a-z0-9]+/g) ?? []
+  for (let i = 0; i < toks.length - 2; i++) {
+    if (toks[i] === "day" && toks[i + 1] === "after" && approxToken(toks[i + 2]!, "tomorrow")) {
+      return arrDay + 2
+    }
+  }
   for (const t of toks) {
     if (approxToken(t, "ylihuomenna") || approxToken(t, "overmorgon")) return arrDay + 2
   }
   if (/\bi\s+morg[a-z]*\b/.test(f)) return arrDay + 1
+  for (let i = 0; i < toks.length - 1; i++) {
+    if (toks[i] === "i" && approxToken(toks[i + 1]!, "morgon")) return arrDay + 1
+  }
   for (const t of toks) {
     if (t === "tmrw" || t === "tmw" || approxToken(t, "huomenna") || approxToken(t, "imorgon") || approxToken(t, "tomorrow")) {
       return arrDay + 1
@@ -325,8 +338,11 @@ function splitClauses(rawText: string): string[] {
 
   const merged: string[] = []
   for (const p of rawParts) {
-    const fp = foldAscii(p)
-    if (merged.length > 0 && /^(?:korjaus|correction|rattelse)\b/.test(fp)) {
+    const firstTok = tokenizeFolded(p)[0] ?? ""
+    if (
+      merged.length > 0 &&
+      (approxToken(firstTok, "korjaus") || approxToken(firstTok, "correction") || approxToken(firstTok, "rattelse"))
+    ) {
       merged[merged.length - 1] += " __CORR__ " + p.replace(/^[^:]*:\s*/, "")
     } else {
       merged.push(p)
@@ -338,12 +354,26 @@ function splitClauses(rawText: string): string[] {
 function splitCorrection(clause: string): { base: string; corr: string | null; rawClean: string } {
   const clean = stripNumericNoise(stripNegations(clause))
   const corrRegex =
-    /(?:\b__CORR__\b|,\s*(?:ei\s*kun|eikun|tai\s+siis|sorry(?:\s*,?\s*i\s+mean)?|i\s+mean|actually|nej\s+forlat|nej\s+förlåt|eller\s+rattare\s+sagt|rattare\s+sagt)\b|\b(?:ei\s*kun|eikun)\b)/i
+    /(?:\b__CORR__\b|,\s*(?:ei\s*kun|eikun|tai\s+siis|sorry(?:\s*,?\s*i\s+mean)?|i\s+mean|actually|nej\s+f[oö]rl[aå]t|eller\s+r[aä]ttare\s+sagt|r[aä]ttare\s+sagt)\b|\b(?:ei\s*kun|eikun)\b)/i
   const parts = clean.split(corrRegex)
   if (parts.length >= 2) {
     return { base: parts[0]!, corr: parts[parts.length - 1]!, rawClean: clean }
   }
   return { base: clean, corr: null, rawClean: clean }
+}
+
+function extractCorrectedRange(clause: string): { opens: number; closes: number } | null {
+  const { base, corr } = splitCorrection(clause)
+  const baseRng = extractRange(base)
+  if (corr) {
+    const corrRng = extractRange(corr)
+    if (corrRng) return corrRng
+    const corrMin = extractClockMinutes(corr)
+    if (baseRng && corrMin !== null && corrMin > baseRng.opens) {
+      return { opens: baseRng.opens, closes: corrMin }
+    }
+  }
+  return baseRng
 }
 
 function extractDayAndClock(clause: string, arrivedAt: number): number | null {
@@ -530,16 +560,18 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
 
     // 4c. Delivery opening hours (`deliveryHours`)
     const fcTokens = tokenizeFolded(rawClean)
-    const hasKohde = fcTokens.some((t) => t === "kohde" || t.startsWith("kohte"))
+    const hasKohde = fcTokens.some(
+      (t) => t !== "kohta" && !t.startsWith("kaht") && !t.startsWith("kahd") && (approxToken(t, "kohde") || approxPrefix(t, "kohte")),
+    )
     const isDeliveryHoursCtx =
       hasKohde ||
       hasAnyStem(fc, [], ["vastaanot", "toimitusosoit", "mottag", "receiv", "destin"]) ||
       (hasAnyStem(fc, [], ["perill"]) &&
-        (extractRange(rawClean) !== null || hasAnyStem(fc, ["auki", "asti"], ["kiinni", "ketaan", "sulke"])))
+        (extractCorrectedRange(clause) !== null || hasAnyStem(fc, ["auki", "asti"], ["kiinni", "ketaan", "sulke"])))
 
     if (isDeliveryHoursCtx) {
       if (lastLeg.deliveryHours && !reqLastLeg.delivery.privateAddress) {
-        const rng = extractRange(rawClean)
+        const rng = extractCorrectedRange(clause)
         if (rng) {
           lastLeg.deliveryHours.opens = Math.max(lastLeg.deliveryHours.opens, rng.opens)
           lastLeg.deliveryHours.closes = Math.min(lastLeg.deliveryHours.closes, rng.closes)
@@ -552,7 +584,7 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
     }
 
     // 4d. Pickup opening hours range (`pickupHours`)
-    const rng = extractRange(rawClean)
+    const rng = extractCorrectedRange(clause)
     if (rng) {
       if (leg0.pickupHours && !reqLeg0.pickup.privateAddress) {
         leg0.pickupHours.opens = Math.max(leg0.pickupHours.opens, rng.opens)
@@ -567,6 +599,10 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
         fc.replace(/'/g, ""),
       )
 
+    const hasExplicitLatest =
+      hasAnyStem(fc, [], ["viimeist", "senast", "latest"]) || /\bno\s+later\s+than\b/.test(fc)
+    const hasReadyWord = hasAnyStem(fc, ["klar", "ready"], ["valmi"])
+
     const isPickupClose =
       !isNotBefore &&
       (hasAnyStem(fc, ["asti"], ["saakka", "until", "sulke", "stang", "kiinni", "closes", "ketaan"]) ||
@@ -576,7 +612,9 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
         /\bingen\s+utlamning\b/.test(fc) ||
         /\bei\s+enaa\s+luovutuks/.test(fc) ||
         (hasAnyStem(fc, ["haku"], ["nouto", "haettav", "hakea", "hamta", "hamtning", "collect", "pick", "pickup"]) &&
-          (hasAnyStem(fc, ["fore"], ["ennen", "before", "viimeist", "senast"]) || /\bno\s+later\s+than\b/.test(fc))))
+          (hasExplicitLatest ||
+            hasAnyStem(fc, ["fore"], ["ennen", "before"]) ||
+            (!hasReadyWord && hasAnyStem(fc, ["by"], [])))))
 
     if (isPickupClose) {
       const closeMin = extractCorrectedMinutes(clause)
@@ -593,7 +631,7 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
 
     const isReadyCtx =
       isNotBefore ||
-      hasAnyStem(fc, ["klar", "ready"], [
+      hasAnyStem(fc, ["klar", "ready", "forst"], [
         "valmi",
         "noudettav",
         "haettav",
@@ -609,7 +647,7 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
         "odottaa",
         "worksh",
       ]) ||
-      /\b(?:voi\s+noutaa|saa\s+hakea|pickup\s+from|kan\s+hamta)\b/.test(fc)
+      /\b(?:voi\s+noutaa|saa\s+hakea|pickup\s+from|kan\s+hamtas?|hamtas\s+forst)\b/.test(fc)
 
     if (isReadyCtx) {
       const t = extractDayAndClock(clause, request.arrivedAt)

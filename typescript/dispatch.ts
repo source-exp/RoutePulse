@@ -42,6 +42,20 @@ function clampOutOfNight(t: number, staggerIdx = 0): number {
   return t
 }
 
+function buildMonotonicClampedSteps(
+  now: number,
+  stepGap: number,
+  mults: readonly number[],
+  feeFn: (mult: number, k: number) => number,
+): FeeStep[] {
+  let prevAt = now
+  return mults.map((mult, k) => {
+    const at = k === 0 ? now : Math.max(prevAt + 20, clampOutOfNight(now + k * stepGap, k))
+    prevAt = at
+    return { at, feeCents: feeFn(mult, k) }
+  })
+}
+
 function normalizeSteps(steps: FeeStep[], now: number, maxFeeCents = Infinity, minFirstFeeCents = 1): FeeStep[] {
   const cap = Math.max(1, Math.round(maxFeeCents))
   const floor0 = Math.min(cap, Math.max(1, Math.round(minFirstFeeCents)))
@@ -88,8 +102,10 @@ export function buildSingleGigSchedule(
     ctx.withCharging ||
     ctx.withPlates
 
+  const fluToday = ctx.fluActive && Math.floor(ctx.effectiveLastPickupAt / DAY) === Math.floor(ctx.now / DAY)
+
   let m0 = 0.85
-  if (D_pool30 >= 95 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !ctx.fluActive && ctx.routeKm <= 220) {
+  if (D_pool30 >= 95 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !fluToday && ctx.routeKm <= 220) {
     m0 -= 0.04 // 0.81x on dense hub->hub (including Espoo/Vantaa/Lempäälä/Raisio 30km clusters!)
   }
   if (D_pool30 <= 5 && !sameCluster30) m0 += 0.08
@@ -109,7 +125,7 @@ export function buildSingleGigSchedule(
   if (ctx.withPlates || ctx.audience.manualLicence) m0 += 0.04
   if (isEveningOrSat) m0 += 0.06
   if (ctx.snowOverlap) m0 += 0.12
-  if (ctx.fluActive) m0 += 0.10
+  if (fluToday) m0 += 0.08
 
   m0 = Math.max(0.80, Math.min(hasExtras || ctx.snowOverlap ? 1.45 : 1.32, m0))
 
@@ -134,10 +150,7 @@ export function buildSingleGigSchedule(
       Math.max(m0 + 1.75, 2.95),
     ]
     return normalizeSteps(
-      rescueMults.map((mult, k) => ({
-        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 35, k),
-        feeCents: Math.round(ctx.baseRefFeeCents * mult),
-      })),
+      buildMonotonicClampedSteps(ctx.now, 35, rescueMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
       ctx.now,
       maxEconFee,
       ctx.minFloorFeeCents,
@@ -156,10 +169,7 @@ export function buildSingleGigSchedule(
       Math.max(m0 + 0.82, 1.85),
     ]
     return normalizeSteps(
-      lateDayMults.map((mult, k) => ({
-        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 70, k),
-        feeCents: Math.round(ctx.baseRefFeeCents * mult),
-      })),
+      buildMonotonicClampedSteps(ctx.now, 70, lateDayMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
       ctx.now,
       maxEconFee,
       1,
@@ -178,10 +188,7 @@ export function buildSingleGigSchedule(
       Math.max(m0 + 1.26, maxUrgentMult),
     ]
     return normalizeSteps(
-      stepMults.map((mult, k) => ({
-        at: k === 0 ? ctx.now : clampOutOfNight(ctx.now + k * 25, k),
-        feeCents: Math.round(ctx.baseRefFeeCents * mult),
-      })),
+      buildMonotonicClampedSteps(ctx.now, 25, stepMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
       ctx.now,
       maxEconFee,
       ctx.minFloorFeeCents,
@@ -407,20 +414,23 @@ function evaluateOrderedBundle(
 
   const refSum = a.request.referenceFeeCents + b.request.referenceFeeCents
   const refMax = Math.max(a.request.referenceFeeCents, b.request.referenceFeeCents)
-  const mktMult = 1.0 + (snow1 || snow2 ? 0.10 : 0) + (fluActive ? 0.08 : 0)
+  const fluTodayBundle = fluActive && Math.floor(minLastPickup / DAY) === Math.floor(now / DAY)
+  const mktMult = 1.0 + (snow1 || snow2 ? 0.10 : 0) + (fluTodayBundle ? 0.06 : 0)
   const coeffs = tier === 1 ? [0.58, 0.66, 0.75, 0.85] : [0.66, 0.74, 0.83, 0.93]
 
   const crossesNightBundle = Math.floor(minLastPickup / DAY) > Math.floor(now / DAY) && minLastPickup - now >= 600
   const lpaDayStart = Math.floor(minLastPickup / DAY) * DAY
 
+  let prevStepAt2 = now
   const schedule = normalizeSteps(
     coeffs.map((c, k) => {
       const rawStepAt =
         k === 0
           ? now
           : crossesNightBundle && k >= 2
-            ? Math.max(now + k * 35, lpaDayStart + 7 * HOUR + 15 + (k - 2) * 50)
-            : clampOutOfNight(now + k * 30, k)
+            ? Math.max(prevStepAt2 + 20, Math.max(now + k * 35, lpaDayStart + 7 * HOUR + 15 + (k - 2) * 50))
+            : Math.max(prevStepAt2 + 20, clampOutOfNight(now + k * 30, k))
+      prevStepAt2 = rawStepAt
       return {
         at: rawStepAt,
         feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),

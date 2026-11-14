@@ -510,13 +510,34 @@ export function buildStopsForOrder(
           const lastLegObj = order.legs[legIndices[legIndices.length - 1]!]!
           const lastNoteObj = notes[legIndices[legIndices.length - 1]!]
           const lastDelivH = lastNoteObj?.deliveryHours ?? lastLegObj.delivery.hours
-          const totRoad = legIndices.reduce(
-            (s, li) => s + map.roadMinutes(order.legs[li]!.pickup.placeId, order.legs[li]!.delivery.placeId),
-            0,
+          let totRoad = 0
+          let extraM = 0
+          for (let k = 0; k < legIndices.length; k++) {
+            const li = legIndices[k]!
+            const lObj = order.legs[li]!
+            const nObj = notes[li]
+            const rObj = retriesByLeg.get(li) ?? EMPTY_RETRY
+            totRoad += map.roadMinutes(lObj.pickup.placeId, lObj.delivery.placeId)
+            if (k > 0) {
+              const prevObj = order.legs[legIndices[k - 1]!]!
+              const sameCust =
+                prevObj.delivery.placeId === lObj.pickup.placeId &&
+                prevObj.delivery.privateAddress &&
+                lObj.pickup.privateAddress
+              if (!sameCust) totRoad += map.roadMinutes(prevObj.delivery.placeId, lObj.pickup.placeId)
+              extraM += 20
+            }
+            if (map.needsCharging(lObj.car, lObj.pickup.placeId, lObj.delivery.placeId)) extraM += CHARGING_MINUTES
+            if ((li === 0 && notes[0]?.needsPlates) || nObj?.needsPlates || rObj.plates) extraM += PLATES_MINUTES
+          }
+          const endWorldSw = snow.overlaps(
+            leg.pickup.placeId,
+            lastLegObj.delivery.placeId,
+            Math.max(now, endsAt - DAY),
+            endsAt,
           )
-          const extraM = (withCharging ? CHARGING_MINUTES : 0) + (withPlates ? PLATES_MINUTES : 0)
-          const endWorldDeliv = latestOpenBefore(endsAt, lastDelivH, 15)
-          const endWorldPickCap = endWorldDeliv - Math.ceil(totRoad * 1.06) - extraM - 20
+          const endWorldDeliv = lastDelivH ? latestOpenBefore(endsAt, lastDelivH, 15) : endsAt - 15
+          const endWorldPickCap = endWorldDeliv - Math.ceil(totRoad * (endWorldSw ? 1.32 : 1.06)) - extraM - 20
 
           if (
             !omitSoftPickupCap &&
@@ -560,13 +581,13 @@ export function buildStopsForOrder(
       (withPlates ? PLATES_MINUTES : 0)
 
     if (leg.delivery.privateAddress) {
-      // On leg 0 of a 2-leg trade-in, order.deadline is leg 1's dealer deadline, so cap leg 0 delivery to customer's booked slot!
-      if (combinedTradeIn && idx === 0) {
-        const minReach = Math.max(now + 15, pickupStop.window?.from ?? leg.pickup.window.from) + driveMin + 15
-        if (leg.delivery.window.to + 15 >= minReach && leg.delivery.window.to > now + 30) {
+      // On leg 0 of an on-time 2-leg trade-in, cap leg 0 delivery to customer's booked slot + 30m (omit when already late so server extends to endsAt!)
+      if (!omitSoftPickupCap && combinedTradeIn && idx === 0) {
+        const minReach = Math.max(now + 15, pickupStop.window?.from ?? leg.pickup.window.from) + driveMin + 10
+        if (leg.delivery.window.to + 30 >= minReach && leg.delivery.window.to + 30 > now + 30) {
           deliveryStop.window = {
             from: leg.delivery.window.from,
-            to: leg.delivery.window.to + 15,
+            to: leg.delivery.window.to + 30,
           }
         }
       }
@@ -613,6 +634,21 @@ export function buildStopsForOrder(
         deliveryStop.window = {
           from: leg.delivery.window.from,
           to: effDl,
+        }
+      }
+
+      if (omitSoftPickupCap && !deliveryStop.window && idx === legIndices[legIndices.length - 1] && endsAt - now <= 60 * HOUR) {
+        const endWorldDeliv = realDelivHours ? latestOpenBefore(endsAt, realDelivHours, 15) : endsAt - 15
+        if (
+          Number.isFinite(endWorldDeliv) &&
+          endWorldDeliv < endsAt - 15 &&
+          endWorldDeliv >= minReachableDeliv &&
+          endWorldDeliv > now + 30
+        ) {
+          deliveryStop.window = {
+            from: leg.delivery.window.from,
+            to: endWorldDeliv,
+          }
         }
       }
     }
