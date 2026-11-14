@@ -263,11 +263,9 @@ export class CompetitorMarketEstimator {
 
   onNewDay(day: number): void {
     if (day <= this.currentDay) return
-    // Recover baseline worldLogMean if Monday had an unflagged Price War (-20% = -0.223 log drop),
-    // while NEVER double-recovering when Monday already flagged priceWarToday!
-    if (this.priceWarToday) {
-      this.priceWarUsedThisWeek = true
-    } else if (
+    // Recover baseline worldLogMean when Monday had a Price War (-20% = -0.223 log drop):
+    // even when Monday flagged priceWarToday, pre-trigger quotes dragged worldLogMean + dayLogOffset down by ~-0.223 before freezing!
+    if (
       this.level === 8 &&
       this.currentDay === 0 &&
       !this.priceWarUsedThisWeek &&
@@ -280,9 +278,10 @@ export class CompetitorMarketEstimator {
         Math.max(this.minWorldLog, this.worldLogMean + this.dayLogOffset - Math.log(0.80)),
       )
     }
+    if (this.priceWarToday) this.priceWarUsedThisWeek = true
     if (this.outageCenterToday) {
       const endSt = this.regionOutStats.get(this.outageCenterToday)
-      if (endSt && (endSt.llr >= 1.5 || endSt.sumResIn / Math.max(1, endSt.nIn) >= 0.14)) {
+      if (endSt && endSt.llr >= 1.8 && endSt.sumResIn / Math.max(1, endSt.nIn) >= 0.14) {
         this.outageUsedThisWeek = true
       }
     }

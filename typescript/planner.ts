@@ -198,6 +198,7 @@ export function computeOptionPlan(
   const effectiveDeadline = noteDl !== null ? Math.min(promisedDeadline, noteDl) : promisedDeadline
 
   let totalRoadMinutes = 0
+  let serverMultiCarRoadMinutes = 0
   let totalRoadKm = 0
   let privatePickupCount = 0
   let privateDeliveryCount = 0
@@ -222,12 +223,14 @@ export function computeOptionPlan(
       prev.delivery.privateAddress &&
       leg.pickup.privateAddress
 
-    const linkRoad = prev === undefined ? 0 : sameCustomerTradeIn ? 0 : map.roadMinutes(prev.delivery.placeId, leg.pickup.placeId)
+    const rawServerLinkRoad = prev === undefined ? 0 : map.roadMinutes(prev.delivery.placeId, leg.pickup.placeId)
+    const linkRoad = prev === undefined ? 0 : sameCustomerTradeIn ? 0 : rawServerLinkRoad
     const driveRoad = map.roadMinutes(leg.pickup.placeId, leg.delivery.placeId)
     const driveKm = map.roadKm(leg.pickup.placeId, leg.delivery.placeId)
-    if (!Number.isFinite(linkRoad) || !Number.isFinite(driveRoad)) return undefined
+    if (!Number.isFinite(rawServerLinkRoad) || !Number.isFinite(driveRoad)) return undefined
 
     totalRoadMinutes += linkRoad + driveRoad
+    serverMultiCarRoadMinutes += rawServerLinkRoad + driveRoad
     totalRoadKm += driveKm + (prev === undefined || sameCustomerTradeIn ? 0 : map.roadKm(prev.delivery.placeId, leg.pickup.placeId))
     if (leg.pickup.privateAddress) privatePickupCount++
     if (leg.delivery.privateAddress) privateDeliveryCount++
@@ -288,7 +291,7 @@ export function computeOptionPlan(
     at = delivStart + delivService
   }
 
-  const canSingleGig = legs.length === 1 || totalRoadMinutes <= MAX_MULTI_CAR_ROAD_MINUTES
+  const canSingleGig = legs.length === 1 || serverMultiCarRoadMinutes <= MAX_MULTI_CAR_ROAD_MINUTES
 
   // 2. Backward effectiveLastPickupAt (accounts for noteDeadline, note hours, plates, charging, snow, 20:00 cliff buffer)
   let latestNextPickup = Number.POSITIVE_INFINITY
@@ -599,7 +602,7 @@ export function buildStopsForOrder(
       const minReachableDeliv = Math.max(now + 15, pickupStop.window?.from ?? leg.pickup.window.from) + driveMin + 20
 
       if (narrowedDeliv && realDelivHours) {
-        if (!omitSoftPickupCap && minReachableDeliv <= effDl) {
+        if ((!omitSoftPickupCap || now <= order.lastPickupAt) && minReachableDeliv <= effDl) {
           const firstWin = nextRealDayWindow(minReachableDeliv, effDl, realDelivHours, 30)
           if (firstWin && firstWin.to - minReachableDeliv < 150) {
             const nextDayStart = (Math.floor(firstWin.to / DAY) + 1) * DAY
@@ -621,7 +624,7 @@ export function buildStopsForOrder(
               to: firstWin.to,
             }
           }
-        } else {
+        } else if (now > order.lastPickupAt) {
           const nextWin = nextRealDayWindow(minReachableDeliv, endsAt - 30, realDelivHours, 45)
           if (nextWin && nextWin.to > now + 30) {
             deliveryStop.window = {
@@ -637,7 +640,13 @@ export function buildStopsForOrder(
         }
       }
 
-      if (omitSoftPickupCap && !deliveryStop.window && idx === legIndices[legIndices.length - 1] && endsAt - now <= 60 * HOUR) {
+      if (
+        omitSoftPickupCap &&
+        now > order.lastPickupAt &&
+        !deliveryStop.window &&
+        idx === legIndices[legIndices.length - 1] &&
+        endsAt - now <= 60 * HOUR
+      ) {
         const endWorldDeliv = realDelivHours ? latestOpenBefore(endsAt, realDelivHours, 15) : endsAt - 15
         if (
           Number.isFinite(endWorldDeliv) &&

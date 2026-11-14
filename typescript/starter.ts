@@ -720,7 +720,7 @@ class Desk {
         this.offers.attemptedGigDrivers.add(`${ev.gigId}:${ev.driverId}`)
       } else if (ev.kind === "gig_dropped") {
         const tod = ev.at % DAY
-        if (!this.fluUsedThisWeek && tod < 90) {
+        if (!this.fluUsedThisWeek && Math.floor(ev.at / DAY) < 5 && tod < 90) {
           this.midnightFluDrops++
           if (this.midnightFluDrops >= (this.supply.totalDrivers < 740 ? 6 : 8)) {
             this.fluActiveToday = true
@@ -869,7 +869,8 @@ class Desk {
         const vg = this.gigs.get(event.gigId)
         if (vg && vg.status === "open" && this.now >= vg.postedAt + 8) {
           const vCount = this.offers.gigViewers.get(event.gigId)?.get(event.driverId)?.count ?? 0
-          if (vCount >= 2) {
+          const pairKey = `${event.gigId}:${event.driverId}`
+          if (vCount >= 2 && !this.offers.attemptedGigDrivers.has(pairKey) && this.offers.openCount(event.gigId) < 3) {
             vg.nextOfferCheckAt = this.now
             this.needsImmediateOfferPass = true
           }
@@ -1247,8 +1248,14 @@ class Desk {
   }
 
   private handleGigBooked(gigId: string, driverId: string, feeCents: number, at: number): void {
+    const existingG = this.gigs.get(gigId)
+    if (existingG && existingG.status === "booked" && existingG.driverId === driverId) {
+      existingG.feeCents = feeCents
+      if (existingG.bookedAt === null) existingG.bookedAt = at
+      return
+    }
     this.offers.recordBooked(driverId, gigId, at)
-    const g = this.gigs.get(gigId)
+    const g = existingG
     if (g) {
       // Fix same-minute race: if an earlier `order_won` in this same step tried to withdraw `g` to bundle it,
       // cancel the pending `withdraw` + bundle `post`, re-link `g` as booked, and post the new partner solo!
@@ -1296,7 +1303,7 @@ class Desk {
     const g = this.gigs.get(gigId)
     if (!g) return
 
-    if (isDrop && !this.fluUsedThisWeek) {
+    if (isDrop && !this.fluUsedThisWeek && Math.floor(this.now / DAY) < 5) {
       const tod = this.now % DAY
       const p0 = g.stops[0]
       const o0 = p0 ? this.orders.get(p0.orderId) : undefined
@@ -1326,8 +1333,28 @@ class Desk {
         bOrders.length > 0
           ? Math.min(...bOrders.map((o) => this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt))
           : -Infinity
+      // Only reject Franken-bundles where `order_changed` rerouted a partner far away before the drop!
+      let maxBundleDh = 0
+      let totalBundleRoad = 0
+      let prevPl: string | undefined
+      let prevWasDeliv = false
+      for (const s of g.stops) {
+        const so = this.orders.get(s.orderId)
+        const sLeg = so?.legs[s.leg]
+        if (!sLeg) continue
+        const pl = s.kind === "pickup" ? sLeg.pickup.placeId : sLeg.delivery.placeId
+        if (prevPl !== undefined && prevPl !== pl) {
+          const seg = this.map.roadMinutes(prevPl, pl)
+          totalBundleRoad += seg
+          if (prevWasDeliv && s.kind === "pickup") maxBundleDh = Math.max(maxBundleDh, seg)
+        }
+        prevWasDeliv = s.kind === "delivery"
+        prevPl = pl
+      }
       if (
         bOrders.length >= 2 &&
+        maxBundleDh <= 65 &&
+        totalBundleRoad <= 675 &&
         minBundleLpa - this.now >= 320 &&
         bOrders.every((o) => !this.urgent.has(o.id))
       ) {
@@ -1819,8 +1846,8 @@ class Desk {
     if (legIndices.length === 2) {
       const l0 = order.legs[legIndices[0]!]!
       const l1 = order.legs[legIndices[1]!]!
-      const sameCust = l0.delivery.placeId === l1.pickup.placeId && l0.delivery.privateAddress && l1.pickup.privateAddress
-      const link = sameCust ? 0 : this.map.roadMinutes(l0.delivery.placeId, l1.pickup.placeId)
+      // Server 12-hour multi-car rule always includes map.roadMinutes(from, to), even for same-place intra-town hops!
+      const link = this.map.roadMinutes(l0.delivery.placeId, l1.pickup.placeId)
       const totalRoad =
         this.map.roadMinutes(l0.pickup.placeId, l0.delivery.placeId) +
         link +
@@ -2513,8 +2540,21 @@ class Desk {
           // Fallback if a bundled or custom-window post was ever refused by the server:
           // never leave any won order orphaned, and never spin-loop if strippedFallback was already tried!
           const failedOrders = this.distinctLiveOrdersOfStops(action.stops)
+          const wasMultiLegSingleOrder =
+            !meta?.isBundledTwoOrder &&
+            failedOrders.length === 1 &&
+            action.stops.filter((s) => s.kind === "pickup").length >= 2
           for (const ord of failedOrders) {
             this.doNotBundle.add(ord.id)
+            const missing = undeliveredLegs(ord).filter(
+              (leg) => !this.legGigs.get(ord.id)?.has(leg) && !this.hasPendingPostInOutbox(ord.id, leg),
+            )
+            if (wasMultiLegSingleOrder && missing.length >= 2) {
+              for (const singleLeg of missing) {
+                this.dispatchOrderLegs(ord, [singleLeg], false)
+              }
+              continue
+            }
             if (meta?.strippedFallback) {
               this.postBackoffUntil.set(ord.id, this.now + 5)
               continue
@@ -2522,9 +2562,6 @@ class Desk {
             if (!meta?.isBundledTwoOrder) {
               this.stripWindowsOrders.add(ord.id)
             }
-            const missing = undeliveredLegs(ord).filter(
-              (leg) => !this.legGigs.get(ord.id)?.has(leg) && !this.hasPendingPostInOutbox(ord.id, leg),
-            )
             if (missing.length > 0) {
               this.dispatchOrderLegs(ord, missing, false)
             }
