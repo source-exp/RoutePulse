@@ -1545,7 +1545,7 @@ class Desk {
       0,
     )
     return Math.abs(routeKm - origKm) > 5
-      ? Math.min(2.25, Math.max(0.45, (1500 + 26 * routeKm) / Math.max(1500, 1500 + 26 * origKm)))
+      ? Math.min(8.5, Math.max(0.45, (1500 + 26 * routeKm) / Math.max(1500, 1500 + 26 * origKm)))
       : 1.0
   }
 

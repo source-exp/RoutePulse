@@ -113,10 +113,9 @@ export function buildSingleGigSchedule(
 
   m0 = Math.max(0.80, Math.min(hasExtras || ctx.snowOverlap ? 1.45 : 1.32, m0))
 
-  // Economic rationality ceiling: never pay a driver more than 2.65x the order's customer price!
   const maxEconFee =
     ctx.orderPriceCents > 0
-      ? Math.max(ctx.baseRefFeeCents, Math.round(ctx.orderPriceCents * 2.65))
+      ? Math.max(Math.round(ctx.baseRefFeeCents * 2.50), Math.round(ctx.orderPriceCents * 2.85))
       : Infinity
 
   if (ctx.level === 1) {
@@ -125,8 +124,8 @@ export function buildSingleGigSchedule(
     return [{ at: ctx.now, feeCents: Math.max(1, fee) }]
   }
 
-  // True End-of-World Undelivered Rescue (final 42h before Wed 22:00 endsAt): guarantee 0.0% undelivered!
-  if (ctx.isPastDeadline && ctx.endsAt - ctx.now <= 42 * HOUR) {
+  // True End-of-World Undelivered Rescue (final 52h before Wed 22:00 endsAt, covering Last Monday 20:31!): guarantee 0.0% undelivered!
+  if (ctx.isPastDeadline && ctx.endsAt - ctx.now <= 52 * HOUR) {
     const rescueMults = [
       Math.max(m0 + 0.45, 1.58),
       Math.max(m0 + 0.75, 1.88),
@@ -148,7 +147,7 @@ export function buildSingleGigSchedule(
   // Rule-4 Mid-Week Already-Late Regime (now > rawLastPickupAt on non-private delivery, >42h before endsAt):
   // On-time delivery is already impossible and delivering tonight at a closed dealer gate vs tomorrow daytime
   // pays the EXACT SAME 25% (<24h) refund! Pace daytime steps calmly instead of gifting 2.40x-3.00x overnight.
-  if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 42 * HOUR) {
+  if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 52 * HOUR) {
     const lateDayMults = [
       Math.max(m0 + 0.10, 1.05),
       Math.max(m0 + 0.24, 1.20),
