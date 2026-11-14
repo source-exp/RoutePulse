@@ -183,11 +183,11 @@ function evaluateOrderedBundle(
     (fluTodayBundle ? 0.06 : 0) +
     (experienced ? 0.14 : 0) +
     (hasPrivDeliv2 ? 0.08 : 0)
-  const deepSlackBundle = minLastPickup - now >= 480 && !experienced && !hasPrivDeliv2
+  const deepSlackBundle = minLastPickup - now >= 500 && !experienced && !hasPrivDeliv2
   const coeffs = deepSlackBundle
     ? tier === 1
-      ? [0.53, 0.60, 0.69, 0.79, 0.86]
-      : [0.61, 0.68, 0.76, 0.85, 0.93]
+      ? [0.50, 0.58, 0.67, 0.77, 0.86]
+      : [0.58, 0.66, 0.75, 0.84, 0.93]
     : tier === 1
       ? [0.58, 0.66, 0.75, 0.85]
       : [0.66, 0.74, 0.83, 0.93]
@@ -195,7 +195,7 @@ function evaluateOrderedBundle(
   const crossesNightBundle = dayOf(minLastPickup) > dayOf(now) && minLastPickup - now >= 600
   const lpaDayStart = dayStartOf(minLastPickup)
   const stepGap = deepSlackBundle ? 25 : 30
-  const refMaxBase = deepSlackBundle ? 0.84 : 0.90
+  const refMaxBase = deepSlackBundle ? 0.80 : 0.90
   const refMaxSlope = deepSlackBundle ? 0.07 : 0.08
 
   let prevStepAt2 = now
@@ -413,11 +413,11 @@ export function tryExtendTwoToThreeOrderBundle(
   const refSum = entries.reduce((s, e) => s + e.request.referenceFeeCents, 0)
   const refMax = Math.max(...entries.map((e) => e.request.referenceFeeCents))
   const mktMult = 1.0 + (anySnow ? 0.10 : 0) + (fluActive ? 0.08 : 0)
-  const coeffs = [0.56, 0.64, 0.72, 0.81]
+  const coeffs = [0.52, 0.60, 0.69, 0.80]
   const schedule = normalizeSteps(
     coeffs.map((kMult, k) => ({
       at: k === 0 ? now : clampOutOfNight(now + k * 30, k),
-      feeCents: Math.round(Math.max(kMult * refSum, (1.04 + 0.08 * k) * refMax) * mktMult),
+      feeCents: Math.round(Math.max(kMult * refSum, (0.98 + 0.08 * k) * refMax) * mktMult),
     })),
     now,
   )

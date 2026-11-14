@@ -380,16 +380,21 @@ export class Desk {
       if (!hasUndeliveredLegs(o)) continue
       const m = this.legGigs.get(o.id)
       let allBooked = true
+      let inEarlyDiscovery = this.pairingBufferUntil.has(o.id)
       for (let leg = 0; leg < o.legs.length; leg++) {
         if (o.deliveredAt[leg] !== null) continue
         const gid = m?.get(leg)
         const g = gid ? this.gigs.get(gid) : undefined
         if (!g || (g.status !== "booked" && g.status !== "working")) {
           allBooked = false
+          if (g && g.status === "open" && !g.urgentEscalated && this.now - g.postedAt <= 95) {
+            const effLpa = this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt
+            if (effLpa - this.now >= 480) inEarlyDiscovery = true
+          }
           break
         }
       }
-      if (!allBooked) count++
+      if (!allBooked) count += inEarlyDiscovery ? 0.55 : 1
     }
     return count
   }
@@ -469,7 +474,11 @@ export class Desk {
       if (!p0) continue
       const o = this.orders.get(p0.orderId)
       const pId = o?.legs[p0.leg]?.pickup.placeId
-      if (pId && cluster.has(pId)) count++
+      if (pId && cluster.has(pId)) {
+        const effLpa = o ? (this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt) : 0
+        const inDiscovery = !g.urgentEscalated && this.now - g.postedAt <= 95 && effLpa - this.now >= 480
+        count += inDiscovery ? 0.55 : 1
+      }
     }
     return count
   }
@@ -1561,6 +1570,10 @@ export class Desk {
   }
 
   private changedKmScaleForOrder(order: Order, req: PriceRequest, legIndices: readonly number[]): number {
+    const legEstRef = (p: string, d: string): number => {
+      const km = this.map.roadKm(p, d)
+      return this.map.isSameCluster30(p, d) ? 1450 + 7.5 * km : 1850 + 24 * km
+    }
     const routeKm = legIndices.reduce(
       (sum, i) => sum + this.map.roadKm(order.legs[i]!.pickup.placeId, order.legs[i]!.delivery.placeId),
       0,
@@ -1569,9 +1582,28 @@ export class Desk {
       (sum, i) => sum + this.map.roadKm(req.legs[i]!.pickup.placeId, req.legs[i]!.delivery.placeId),
       0,
     )
-    return Math.abs(routeKm - origKm) > 5
-      ? Math.min(8.5, Math.max(0.45, (1500 + 26 * routeKm) / Math.max(1500, 1500 + 26 * origKm)))
-      : 1.0
+    const newEst = legIndices.reduce(
+      (sum, i) => sum + legEstRef(order.legs[i]!.pickup.placeId, order.legs[i]!.delivery.placeId),
+      0,
+    )
+    const origEst = legIndices.reduce(
+      (sum, i) => sum + legEstRef(req.legs[i]!.pickup.placeId, req.legs[i]!.delivery.placeId),
+      0,
+    )
+    if (Math.abs(routeKm - origKm) <= 5 && Math.abs(newEst - origEst) <= 80) return 1.0
+
+    const rawRatio = newEst / Math.max(1200, origEst)
+    const baseOrigRef = (req.referenceFeeCents * legIndices.length) / Math.max(1, order.legs.length)
+    const hasExtraCarCost = legIndices.some(
+      (i) =>
+        order.legs[i]!.car.premium ||
+        this.map.needsCharging(order.legs[i]!.car, order.legs[i]!.pickup.placeId, order.legs[i]!.delivery.placeId),
+    )
+    if (Math.abs(routeKm - origKm) > 150 && !hasExtraCarCost && baseOrigRef > 0) {
+      const targetRef = 0.65 * (baseOrigRef * rawRatio) + 0.35 * newEst
+      return Math.min(8.5, Math.max(0.45, targetRef / baseOrigRef))
+    }
+    return Math.min(8.5, Math.max(0.45, rawRatio))
   }
 
   private evaluateOrderUrgency(
@@ -1657,6 +1689,7 @@ export class Desk {
       effectiveLastPickupAt: b.effectiveLastPickupAt,
       rawLastPickupAt: order.lastPickupAt,
       earliestPickupAt,
+      tier24PickupCapAt: b.tier24PickupCapAt,
       audience: b.audience,
       hasPrivatePickup: legIndices.some((i) => order.legs[i]!.pickup.privateAddress),
       hasPrivateDelivery: legIndices.some((i) => order.legs[i]!.delivery.privateAddress),
@@ -1939,8 +1972,8 @@ export class Desk {
     let refSum = 0
     let minEffLpa = Infinity
     let hasPrivate = false
-    let anyUrgent = g.urgentEscalated
-    let anyPastDeadline = g.pastDeadlineEscalated
+    let anyUrgent = false
+    let anyPastDeadline = false
     const orderIds: string[] = []
 
     for (const p of pickups) {
@@ -1950,12 +1983,25 @@ export class Desk {
       if (!orderIds.includes(o.id)) orderIds.push(o.id)
       const kmScale = this.changedKmScaleForOrder(o, r, [p.leg])
       refSum += (r.referenceFeeCents / o.legs.length) * kmScale
-      const lpa = this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt
-      if (lpa < minEffLpa) minEffLpa = lpa
       const leg = o.legs[p.leg]
       if (leg && (leg.pickup.privateAddress || leg.delivery.privateAddress)) hasPrivate = true
-      if (this.urgent.has(o.id)) anyUrgent = true
-      if (this.now > o.deadline) anyPastDeadline = true
+
+      const isPostLpa = this.now > o.lastPickupAt
+      const lpa = isPostLpa
+        ? (p.window?.to ?? this.endsAt - 45)
+        : (this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt)
+      if (lpa < minEffLpa) minEffLpa = lpa
+
+      if (isPostLpa) {
+        const isEndWorldRescue = this.now > o.deadline && this.endsAt - this.now <= 42 * HOUR
+        if (isEndWorldRescue || Boolean(leg?.delivery.privateAddress)) {
+          anyUrgent = true
+          if (this.now > o.deadline) anyPastDeadline = true
+        }
+      } else {
+        if (g.urgentEscalated || this.urgent.has(o.id)) anyUrgent = true
+        if (g.pastDeadlineEscalated || this.now > o.deadline) anyPastDeadline = true
+      }
     }
 
     const { totalRoadMinutes: driveMinutes } = this.measureStopsRoadStats(g.stops)

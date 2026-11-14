@@ -321,7 +321,7 @@ export class PricingEngine {
     }
     if (pLate > maxAllowedPLate) return undefined
 
-    let feeMult = 0.89
+    let feeMult = 0.86
     if (
       D_pool30 >= hubPoolThreshold &&
       Q30 >= 40 &&
@@ -330,7 +330,7 @@ export class PricingEngine {
       plan.privateDeliveryCount === 0 &&
       plan.totalRoadKm <= 240
     ) {
-      feeMult -= 0.04
+      feeMult -= 0.045
     }
     if (!sameCluster30) {
       if (isArcticSink) {
@@ -364,7 +364,7 @@ export class PricingEngine {
     if (plan.snowOverlap) feeMult += 0.14
     if (isFluSameDay) feeMult += 0.10
     if (batchLoad > 0.65) feeMult += 0.08 * (batchLoad - 0.65)
-    if (leadHours >= 9 && Q30 >= 25 && !plan.snowOverlap && !isFluSameDay) feeMult -= 0.035
+    if (leadHours >= 8.5 && Q30 >= 22 && !plan.snowOverlap && !isFluSameDay) feeMult -= 0.04
 
     const pEscalate = sigmoid(etaLate + 1.10)
     feeMult += pEscalate * 0.34
@@ -394,8 +394,11 @@ export class PricingEngine {
       }
     }
 
-    feeMult = Math.max(0.74, feeMult)
-    const expectedDriverFee = request.referenceFeeCents * feeMult
+    feeMult = Math.max(0.71, feeMult)
+    const expectedDriverFee = Math.max(
+      plan.premiumAny ? 2600 : 0,
+      request.referenceFeeCents * feeMult,
+    )
 
     const delivProgress = Math.min(1.0, requestProgressFraction(plan.effectiveDeadline))
     const remWinsAfterDeliv = Math.max(0, (1 - delivProgress) * estWeeklyReqs * 0.38)
@@ -479,8 +482,8 @@ export class PricingEngine {
     }
 
     const baseEffectiveCostCents = Math.max(
-      request.referenceFeeCents * 0.65,
-      Math.max(request.referenceFeeCents * 0.78, trueCostCents + refShadowCents) - trustBonusCents,
+      request.referenceFeeCents * 0.62,
+      Math.max(request.referenceFeeCents * 0.75, trueCostCents + refShadowCents) - trustBonusCents,
     )
 
     return {

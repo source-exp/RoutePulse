@@ -14,25 +14,28 @@ Zero runtime dependencies — runs directly on Node 22.18+ or Bun from [`src/sta
 
 ## 1. Results at Level 8
 
-Every score below is verified in [`results/`](results/) with full console logs. Across **25 official ranking weeks** and **70 unseen random practice weeks** (**95 Level-8 weeks**, ~40,000 cars), RoutePulse achieved a **100% ranked rate (`95 / 95`)** and **`0.0%` undelivered cars on every single week**.
+Every score below is verified in [`results/`](results/) with full console logs. Across **30 official ranking weeks**, **Test Final #2**, and **90 unseen random practice weeks** (**121 Level-8 weeks**, ~52,000 cars), RoutePulse achieved a **100% ranked rate (`121 / 121`)** and **`0.0%` undelivered cars on every single week**.
 
-### Official Ranking Rounds (`--board`, 5 secret weeks per round)
+### Official Ranking Rounds (`--board` & `--final`)
 
-| Ranking Round | 5-Week Gross Margin | Won Orders | On-Time Share | Not Delivered | Ranked | Leaderboard Standing |
+| Round | Gross Margin | Won Orders | On-Time Share | Not Delivered | Ranked | Leaderboard Standing |
 |---|---:|---:|---:|---:|---|---|
-| **Saturday `12:00`** (Season 6) | **€95,671.45** | 2,267 | **97.9%** | **0.0%** | **5 / 5** | **`#4` final** (`#1` live at finish) |
-| **Saturday `15:00`** (Season 7) | **€92,830.32** | 2,123 | **97.6%** | **0.0%** | **5 / 5** | **`#1` live** (`+€3,382` vs `#2`) |
-| **Saturday `18:00`** (Season 8, `v19`) | **€79,828.80** | 2,107 | **98.0%** | **0.0%** | **5 / 5** | **`#2` live** of 238 teams (highest Top-12 OT) |
-| **Saturday `00:00`** (Season 4, earlier `v9`) | **€75,474.57** | 1,953 | **96.4%** | **0.0%** | **5 / 5** | `#10` of 151 teams |
-| **Saturday `09:00`** (Season 5, earlier `v14`) | **€73,949.86** | 1,935 | **97.8%** | **0.0%** | **5 / 5** | **`#4` final** |
+| **Saturday `12:00`** (Season 6, 5 wk) | **€95,671.45** | 2,267 | **97.9%** | **0.0%** | **5 / 5** | **`#4` final** (`#1` live at finish) |
+| **Saturday `21:00`** (Season 9, 5 wk, `v21e`) | **€94,298.50** | 2,269 | **97.3%** | **0.0%** | **5 / 5** | **`#3` live** of 240 teams (`+€4,982` vs `#4`) |
+| **Saturday `15:00`** (Season 7, 5 wk) | **€92,830.32** | 2,123 | **97.6%** | **0.0%** | **5 / 5** | **`#1` live** (`+€3,382` vs `#2`) |
+| **Saturday `18:00`** (Season 8, 5 wk, `v19`) | **€79,828.80** | 2,107 | **98.0%** | **0.0%** | **5 / 5** | **`#2` live** of 238 teams (highest Top-12 OT) |
+| **Saturday `20:00` Test Final #2** (`1` wk, `v20`) | **€17,606.16** | 485 | **97.1%** | **0.0%** | **1 / 1** | **`#4` final** of 234 teams (`0` unquoted, `0` failed visits) |
+| **Saturday `00:00`** (Season 4, 5 wk, `v9`) | **€75,474.57** | 1,953 | **96.4%** | **0.0%** | **5 / 5** | `#10` of 151 teams |
+| **Saturday `09:00`** (Season 5, 5 wk, `v14`) | **€73,949.86** | 1,935 | **97.8%** | **0.0%** | **5 / 5** | **`#4` final** |
 
 ### Benchmarks & Unseen Out-of-Sample Generalization (Level 8)
 
 | Evaluation Set | RoutePulse Margin | Baseline Comparison | On-Time Share | Not Delivered | Ranked |
 |---|---:|---|---:|---:|---|
 | **`spread-1` single week** | **+€17,069.05** | **−€72,612.51** for kit starter (**`+€89,681.56`** on same seed) | **98.5%** | **0.0%** | **1 / 1** |
-| **Best single week (`ab19-09`)** | **+€30,056.61** | `+€28,755.90` `v16` (`+€1,300.71` on same seed; `ab16-09`: `+€26,060.73`) | **98.9%** | **0.0%** | **1 / 1** |
-| **5-seed development suite** | **€86,529.95** | `€76,930.88` early `main` (`+€9,599.07` on same 5 seeds) | **97.7%** | **0.0%** | **5 / 5** |
+| **Best single week (`ab22-07`, `v21e`)** | **+€31,229.86** | `+€30,060.61` `v20` (`+€1,169.25` on same seed; `ab19-09`: `+€30,056.61`) | **96.7%** | **0.0%** | **1 / 1** |
+| **`ab22` unseen random weeks (10, `v21e`)** | **€189,872.54** *(€94.9k / 5 wk)* | `€180,569.77` `v20` (**`+€9,302.77`**, `8W–2L` on same 10 seeds) | **96.7%** | **0.0%** | **10 / 10** |
+| **`ab21 + ab22` combined (20, `v21e`)** | **€365,729.98** *(€91.4k / 5 wk)* | `€352,614.73` `v20` (**`+€13,115.25`**, `15W–5L`, $t = 2.51$ on same 20 seeds) | **96.7%** | **0.0%** | **20 / 20** |
 | **`ab19c` unseen random weeks (10, `v19`)** | **€178,581.62** *(€89.3k / 5 wk)* | `€174,890.32` `v18` (**`+€3,691.30`**, `8W–2L` on same 10 seeds) | **97.4%** | **0.0%** | **10 / 10** |
 | **`ab20` unseen random weeks (10, `v20`)** | **€177,177.97** *(€88.6k / 5 wk)* | `€171,278.67` `v19` (**`+€5,899.30`**, `9W–1L`, $t = 3.20$ on same 10 seeds) | **97.5%** | **0.0%** | **10 / 10** |
 | **`ab16` unseen random weeks (10)** | **€176,558.53** *(€88.3k / 5 wk)* | `€167,269.11` pre-`v16` (`+€9,289.42` on same 10 seeds) | **97.8%** | **0.0%** | **10 / 10** |

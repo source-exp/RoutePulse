@@ -250,7 +250,11 @@ export class World {
       let wake = () => {}
       const url = this.client.url.replace(/^http/, "ws") + this.#path("/stream", { after: last })
       // Bun and Node accept headers here; a browser does not, so run your system outside one.
+      let openedAt = Infinity
       const socket = new WebSocket(url, { headers: { authorization: `Bearer ${this.client.key}` } } as unknown as string[])
+      socket.onopen = () => {
+        openedAt = performance.now()
+      }
       socket.onmessage = (message) => (queue.push(JSON.parse(String(message.data))), wake())
       socket.onclose = (close) => (queue.push({ closed: close.code }), wake())
       const onAbort = () => {
@@ -272,7 +276,11 @@ export class World {
           }
           const item = queue.shift()!
           if ("closed" in item) {
-            if (item.closed === 1000) return // the world was deleted
+            if (performance.now() - openedAt >= 5_000) failures = 0
+            if (item.closed === 1000) {
+              const snap = await this.snapshot().catch(() => null)
+              if (!snap || snap.now >= snap.endsAt) return
+            }
             break
           }
           failures = 0
@@ -280,6 +288,7 @@ export class World {
           yield item
         }
       } finally {
+        options.signal?.removeEventListener("abort", onAbort)
         socket.close()
       }
       await sleep(1000)

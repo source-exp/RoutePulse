@@ -424,7 +424,7 @@ function applyFirstLegPickupSafetyCap(params: {
   now: number
   endsAt: number
   omitSoftPickupCap: boolean
-}): void {
+}): number | null {
   const {
     pickupStop,
     map,
@@ -483,7 +483,7 @@ function applyFirstLegPickupSafetyCap(params: {
   const activeLatePickCap =
     now > order.lastPickupAt &&
     Number.isFinite(tier24PickCap) &&
-    tier24PickCap > Math.max(now + 150, minStart + 45)
+    tier24PickCap > Math.max(now + 95, minStart + 35)
       ? Math.min(tier24PickCap, endWorldPickCap)
       : endWorldPickCap
 
@@ -511,6 +511,7 @@ function applyFirstLegPickupSafetyCap(params: {
       pickupStop.window = { from: Math.max(firstLeg.pickup.window.from, curFrom), to: cappedTo }
     }
   }
+  return Number.isFinite(tier24PickCap) ? tier24PickCap : null
 }
 
 function resolveDealerDeliveryWindow(params: {
@@ -588,6 +589,7 @@ export type BuiltOrderStops = {
   audience: Audience
   awaitingPrivateSlotRollover: boolean
   effectiveLastPickupAt: number
+  tier24PickupCapAt: number | null
 }
 
 export function buildStopsForOrder(
@@ -618,6 +620,7 @@ export function buildStopsForOrder(
 
   const stops: StopRef[] = []
   let awaitingPrivateSlotRollover = false
+  let tier24PickupCapAt: number | null = null
 
   for (const idx of legIndices) {
     const leg = order.legs[idx]!
@@ -682,7 +685,7 @@ export function buildStopsForOrder(
         }
 
         if (idx === legIndices[0]) {
-          applyFirstLegPickupSafetyCap({
+          tier24PickupCapAt = applyFirstLegPickupSafetyCap({
             pickupStop,
             map,
             snow,
@@ -746,5 +749,6 @@ export function buildStopsForOrder(
     audience: { experienced, manualLicence },
     awaitingPrivateSlotRollover,
     effectiveLastPickupAt,
+    tier24PickupCapAt,
   }
 }

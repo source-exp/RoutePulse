@@ -76,6 +76,7 @@ async function playFinal(world: World): Promise<void> {
   await desk.send(true)
 
   let lastRosterFetchMs = performance.now()
+  let lastIdleFinalCheckMs = 0
   let lastSeq = startAfterSeq
 
   const pending: Array<DeskEvent | null> = []
@@ -119,7 +120,8 @@ async function playFinal(world: World): Promise<void> {
           desk.handle(item)
         }
       }
-      if (sawNull && batch.every((x) => x === null)) {
+      if (sawNull && batch.every((x) => x === null) && performance.now() - lastIdleFinalCheckMs >= 4_000) {
+        lastIdleFinalCheckMs = performance.now()
         const f = await world.client.final().catch(() => null)
         if (f && f.now > desk.now) {
           const missed = await world.events(lastSeq).catch(() => [])

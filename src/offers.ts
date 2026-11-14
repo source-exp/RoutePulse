@@ -103,11 +103,11 @@ function computeOfferFeeCents(params: {
   } = params
 
   if (gig.orderIds.length > 1) {
-    const baseCapRatio = gig.orderIds.length >= 3 ? 0.68 : 0.75
+    const baseCapRatio = gig.orderIds.length >= 3 ? 0.64 : 0.72
     const extraRatio = (gig.audience.experienced ? 0.10 : 0) + (gig.hasPrivateStop ? 0.05 : 0)
     const maxBundleCap = Math.round(gig.refFeeCents * (baseCapRatio + extraRatio))
     const targetBundleOffer = Math.round(
-      gig.currentAppFeeCents * (chained ? 0.96 : vInfo ? 1.05 : 1.02 + gig.offerWave * 0.04),
+      gig.currentAppFeeCents * (chained ? 0.95 : vInfo ? 1.03 : 1.01 + gig.offerWave * 0.03),
     )
     return chained
       ? Math.min(maxBundleCap, Math.max(Math.round(gig.currentAppFeeCents * 0.94), targetBundleOffer))
@@ -143,15 +143,24 @@ function computeOfferFeeCents(params: {
   if (isUrgent && slackMin <= 190) {
     return Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
   }
-  if (isRepeatViewer) {
-    const floorSweet = Math.round(gig.currentAppFeeCents * (isDenseHubSolo ? 1.04 : 1.06))
-    const capSweet = Math.round(gig.currentAppFeeCents * (isDenseHubSolo ? 1.08 : 1.13))
-    return Math.max(floorSweet, Math.min(rawFee, capSweet))
-  }
-  if (isSingleViewer) {
-    const floorSweet = Math.round(gig.currentAppFeeCents * 1.03)
-    const capSweet = Math.round(gig.currentAppFeeCents * (isDenseHubSolo ? 1.06 : 1.09))
-    return Math.max(floorSweet, Math.min(rawFee, capSweet))
+  if (!isUrgent) {
+    const tightSameDay = slackMin <= 380
+    if (isRepeatViewer) {
+      const floorSweet = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.04 : isDenseHubSolo ? 1.02 : 1.03))
+      const capSweet = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.10 : isDenseHubSolo ? 1.05 : 1.08))
+      return Math.max(floorSweet, Math.min(rawFee, capSweet))
+    }
+    if (isSingleViewer) {
+      const floorSweet = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.03 : 1.015))
+      const capSweet = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.07 : 1.055))
+      return Math.max(floorSweet, Math.min(rawFee, capSweet))
+    }
+    if (chained) {
+      const capChained = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.06 : 1.03 + gig.offerWave * 0.04))
+      return Math.max(gig.currentAppFeeCents, Math.min(rawFee, capChained))
+    }
+    const capNonUrgent = Math.round(gig.currentAppFeeCents * (tightSameDay ? 1.10 : 1.06 + gig.offerWave * 0.05))
+    return Math.max(gig.currentAppFeeCents, Math.min(rawFee, capNonUrgent))
   }
   return Math.max(rawFee, gig.currentAppFeeCents)
 }
@@ -336,7 +345,7 @@ export class DirectOfferTracker {
       const workedToday = Boolean(workedTodaySet?.has(d.id))
 
       const fit = evaluateDriverCommitments(map, byDriver.get(d.id) ?? [], gig, execDay)
-      if (fit.overlaps || fit.dayDriveMins + gig.driveMinutes > 440) continue
+      if (fit.overlaps || (fit.dayDriveMins > 0 && fit.dayDriveMins + gig.driveMinutes > 460)) continue
 
       let chained = fit.chained
       if (!chained) {

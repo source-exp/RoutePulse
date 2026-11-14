@@ -16,6 +16,7 @@ export type SingleScheduleContext = {
   effectiveLastPickupAt: number
   rawLastPickupAt: number
   earliestPickupAt: number
+  tier24PickupCapAt?: number | null
   audience: Audience
   hasPrivatePickup: boolean
   hasPrivateDelivery: boolean
@@ -114,9 +115,9 @@ function computeBaseStepMultiplier(
 
   const fluToday = ctx.fluActive && dayOf(ctx.effectiveLastPickupAt) === dayOf(ctx.now)
 
-  let m0 = 0.85
+  let m0 = 0.82
   if (D_pool30 >= 95 && Q30 >= 40 && !hasExtras && !ctx.snowOverlap && !fluToday && ctx.routeKm <= 220) {
-    m0 -= 0.04
+    m0 -= 0.045
   }
   if (D_pool30 <= 5 && !sameCluster30) m0 += 0.08
   else if (D_pool30 <= 14 && !sameCluster30) m0 += 0.05
@@ -125,19 +126,19 @@ function computeBaseStepMultiplier(
   else if (Q30 <= 5) m0 += 0.07
   else if (Q30 <= 15) m0 += 0.03
 
-  if (ctx.routeKm > 260) m0 += 0.07
-  if (ctx.routeKm > 400) m0 += 0.06
-  if (ctx.hasPrivatePickup && !ctx.isTradeInTwoLegs) m0 += 0.14
-  if (ctx.hasPrivateDelivery && !ctx.isTradeInTwoLegs) m0 += 0.16
+  if (ctx.routeKm > 260) m0 += 0.05
+  if (ctx.routeKm > 400) m0 += 0.05
+  if (ctx.hasPrivatePickup && !ctx.isTradeInTwoLegs) m0 += 0.12
+  if (ctx.hasPrivateDelivery && !ctx.isTradeInTwoLegs) m0 += 0.14
   if (ctx.isTradeInTwoLegs) m0 += 0.21
-  if (ctx.audience.experienced) m0 += 0.18
+  if (ctx.audience.experienced) m0 += 0.17
   if (ctx.withCharging) m0 += 0.08
   if (ctx.withPlates || ctx.audience.manualLicence) m0 += 0.04
-  if (isEveningOrSat) m0 += 0.06
+  if (isEveningOrSat) m0 += 0.05
   if (ctx.snowOverlap) m0 += 0.12
   if (fluToday) m0 += 0.08
 
-  return Math.max(0.80, Math.min(hasExtras || ctx.snowOverlap ? 1.45 : 1.32, m0))
+  return Math.max(0.76, Math.min(hasExtras || ctx.snowOverlap ? 1.45 : 1.31, m0))
 }
 
 const RAMP_ANCHORS: ReadonlyArray<{ beforeLpa: number; add: number; floor: number }> = [
@@ -178,8 +179,11 @@ export function buildSingleGigSchedule(
       Math.max(m0 + 1.40, 2.58),
       Math.max(m0 + 1.75, 2.95),
     ]
+    const rescueAbsFloors = [3800, 5000, 6400, 7800, 9500]
     return normalizeSteps(
-      buildMonotonicClampedSteps(ctx.now, 35, rescueMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
+      buildMonotonicClampedSteps(ctx.now, 35, rescueMults, (mult, k) =>
+        Math.max(rescueAbsFloors[k] ?? 3800, Math.round(ctx.baseRefFeeCents * mult)),
+      ),
       ctx.now,
       maxEconFee,
       ctx.minFloorFeeCents,
@@ -187,6 +191,32 @@ export function buildSingleGigSchedule(
   }
 
   if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 42 * HOUR) {
+    const t24 = ctx.tier24PickupCapAt ?? null
+    const cliffSlack = t24 !== null ? t24 - ctx.now : Infinity
+    if (t24 !== null && cliffSlack > 35 && cliffSlack <= 380) {
+      const breakEvenMult =
+        ctx.orderPriceCents > 0
+          ? Math.min(
+              2.12,
+              Math.max(1.68, 1.20 + (0.25 * ctx.orderPriceCents) / Math.max(1, ctx.baseRefFeeCents) + 0.08),
+            )
+          : 1.85
+      const cliffMults = [
+        Math.max(m0 + 0.14, 1.22),
+        Math.max(m0 + 0.28, 1.36),
+        Math.max(m0 + 0.44, Math.min(breakEvenMult, 1.52)),
+        Math.max(m0 + 0.60, Math.min(breakEvenMult, 1.68)),
+        Math.max(m0 + 0.76, breakEvenMult),
+      ]
+      const cliffGap = Math.max(20, Math.min(48, Math.floor(Math.max(80, cliffSlack - 32) / 4)))
+      return normalizeSteps(
+        buildMonotonicClampedSteps(ctx.now, cliffGap, cliffMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
+        ctx.now,
+        maxEconFee,
+        1,
+      )
+    }
+
     const lateDayMults = [
       Math.max(m0 + 0.10, 1.05),
       Math.max(m0 + 0.24, 1.20),
@@ -214,9 +244,14 @@ export function buildSingleGigSchedule(
       Math.max(m0 + 0.94, 2.06 + leadSoft),
       Math.max(m0 + 1.18, maxUrgentMult),
     ]
+    const urgentAbsFloors = ctx.audience.experienced
+      ? [2800, 3400, 4100, 4900, 5800]
+      : [2100, 2600, 3200, 3900, 4700]
     const gap = slackMin >= 175 ? 30 : 24
     return normalizeSteps(
-      buildMonotonicClampedSteps(ctx.now, gap, stepMults, (mult) => Math.round(ctx.baseRefFeeCents * mult)),
+      buildMonotonicClampedSteps(ctx.now, gap, stepMults, (mult, k) =>
+        Math.max(urgentAbsFloors[k] ?? 2100, Math.round(ctx.baseRefFeeCents * mult)),
+      ),
       ctx.now,
       maxEconFee,
       ctx.minFloorFeeCents,
@@ -230,16 +265,16 @@ export function buildSingleGigSchedule(
   const fluToday = ctx.fluActive && dayOf(lpa) === dayOf(ctx.now)
 
   const rampOffsets: Array<{ at: number; mult: number }> = []
-  if (slackMin >= 420 && Q30 >= 15 && !ctx.snowOverlap && !fluToday) {
-    const disc = slackMin >= 720 && Q30 >= 28 ? 0.08 : slackMin >= 520 && Q30 >= 20 ? 0.06 : 0.045
-    const mDisc = Math.max(0.72, m0 - disc)
+  if (slackMin >= 450 && Q30 >= 16 && !ctx.snowOverlap && !fluToday && !ctx.isTradeInTwoLegs) {
+    const disc = slackMin >= 720 && Q30 >= 28 ? 0.09 : 0.06
+    const mDisc = Math.max(0.68, m0 - disc)
     rampOffsets.push({ at: ctx.now, mult: mDisc })
-    const tMid = clampOutOfNight(ctx.now + 42, 0)
-    if (tMid < lpa - 260) {
-      rampOffsets.push({ at: tMid, mult: Math.max(mDisc + 0.025, m0 - disc * 0.45) })
+    const tMid = clampOutOfNight(ctx.now + 45, 0)
+    if (tMid < lpa - 255) {
+      rampOffsets.push({ at: tMid, mult: Math.max(mDisc + 0.03, m0 - disc * 0.45) })
     }
-    const tBase = clampOutOfNight(ctx.now + 88, 1)
-    if (tBase < lpa - 220) {
+    const tBase = clampOutOfNight(ctx.now + 92, 1)
+    if (tBase < lpa - 215) {
       rampOffsets.push({ at: tBase, mult: m0 })
     }
   } else {
