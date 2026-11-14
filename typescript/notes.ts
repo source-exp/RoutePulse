@@ -1,4 +1,5 @@
-import type { OpeningHours, PriceRequest } from "./types.ts"
+import { cloneOpeningHours, DAY, dayOf } from "./time.ts"
+import type { Leg, OpeningHours, Order, PriceRequest } from "./types.ts"
 
 export type ParsedLegNote = {
   readyAt: number
@@ -11,7 +12,46 @@ export type ParsedLegNote = {
   noteDeadline: number | null
 }
 
-const DAY_MINUTES = 1440
+export function createDefaultLegNote(leg: Leg, cloneHours = false): ParsedLegNote {
+  return {
+    readyAt: leg.pickup.window.from,
+    releasedAt: null,
+    pickupHours: cloneHours ? cloneOpeningHours(leg.pickup.hours) : leg.pickup.hours,
+    deliveryHours: cloneHours ? cloneOpeningHours(leg.delivery.hours) : leg.delivery.hours,
+    manualGearbox: false,
+    needsPlates: false,
+    summerTyres: false,
+    noteDeadline: null,
+  }
+}
+
+export function effectiveOrderDeadline(order: Order, notes: readonly ParsedLegNote[]): number {
+  const noteDl = notes[notes.length - 1]?.noteDeadline ?? notes[0]?.noteDeadline ?? null
+  return noteDl !== null ? Math.min(order.deadline, noteDl) : order.deadline
+}
+
+export function reconcileNotesAfterOrderChange(
+  prevOrder: Order | undefined,
+  nextOrder: Order,
+  notes: ParsedLegNote[],
+): void {
+  for (let l = 0; l < nextOrder.legs.length; l++) {
+    const note = notes[l]
+    if (!note) continue
+    const nextLeg = nextOrder.legs[l]!
+    if (!prevOrder || nextLeg.delivery.placeId !== prevOrder.legs[l]?.delivery.placeId) {
+      note.noteDeadline = null
+      if (l === nextOrder.legs.length - 1 && notes[0]) notes[0].noteDeadline = null
+      note.deliveryHours = cloneOpeningHours(nextLeg.delivery.hours)
+    } else if (nextOrder.deadline > prevOrder.deadline && note.noteDeadline !== null) {
+      const shift = nextOrder.deadline - prevOrder.deadline
+      note.noteDeadline = note.noteDeadline + shift
+      if (l === nextOrder.legs.length - 1 && notes[0]?.noteDeadline !== null) {
+        notes[0].noteDeadline = notes[0].noteDeadline + shift
+      }
+    }
+  }
+}
 
 function foldAscii(s: string): string {
   return s
@@ -99,7 +139,6 @@ function stripNegations(clause: string): string {
   let s = clause.replace(/\(\s*(?:not|no|ei|inte)\b([^)]*)\)/gi, (full, rest: string) =>
     startsWithProtectedAfterNeg(rest) ? full : " ",
   )
-  // Strip negated contrast prefix before vaan/utan/but (e.g. "ei klo 12, vaan klo 15" -> " klo 15")
   s = s.replace(/(?:^|[,\s])\b(?:not|ei|inte)\b([^,.;!?]*?),?\s*\b(?:vaan|utan|but)\b/gi, (full, rest: string) =>
     startsWithProtectedAfterNeg(rest) ? full : " ",
   )
@@ -136,14 +175,12 @@ const WORD_HOUR_STEMS: ReadonlyArray<{ hour: number; stems: readonly string[]; e
 ]
 
 function matchWordHourToken(tok: string): number | null {
-  // Pass 1: exact token or exact stem prefix first (prevents "yhdesta"=13 matching "yhdeks"=9 via fuzzy edit!)
   for (const entry of WORD_HOUR_STEMS) {
     if (entry.exact.includes(tok)) return entry.hour
     for (const st of entry.stems) {
       if (tok.startsWith(st) && !(entry.hour >= 13 && tok.length >= 11)) return entry.hour
     }
   }
-  // Pass 2: typo-tolerant prefix match
   for (const entry of WORD_HOUR_STEMS) {
     for (const st of entry.stems) {
       if (approxPrefix(tok, st)) return entry.hour
@@ -181,8 +218,18 @@ function extractRange(clause: string): { opens: number; closes: number } | null 
   return null
 }
 
+const WEEKDAY_DEFS: ReadonlyArray<{ wd: number; exact: readonly string[]; stems: readonly string[] }> = [
+  { wd: 0, exact: ["ma", "man", "mon"], stems: ["maanant", "mandag", "monday"] },
+  { wd: 1, exact: ["ti", "tis", "tue", "tues"], stems: ["tiist", "tisdag", "tuesday"] },
+  { wd: 2, exact: ["ke", "ons", "wed"], stems: ["keskiv", "onsdag", "wednesday"] },
+  { wd: 3, exact: ["to", "tor", "tors", "thu", "thur", "thurs"], stems: ["torst", "torsdag", "thursday"] },
+  { wd: 4, exact: ["pe", "fre", "fri"], stems: ["perjant", "fredag", "friday"] },
+  { wd: 5, exact: ["la", "lor", "sat"], stems: ["lauant", "lordag", "saturday"] },
+  { wd: 6, exact: ["su", "son", "sun"], stems: ["sunnunt", "sondag", "sunday"] },
+]
+
 function extractDay(fragment: string, arrivedAt: number): number | null {
-  const arrDay = Math.floor(arrivedAt / DAY_MINUTES)
+  const arrDay = dayOf(arrivedAt)
   const f = foldAscii(fragment)
     .replace(/\b(?:ma|man|mon)\s*-\s*(?:pe|fre|fri)\b/g, " ")
     .replace(/\b(?:maanantai\w*|mandag\w*|monday)\s*-\s*(?:perjantai\w*|fredag\w*|friday)\b/g, " ")
@@ -211,21 +258,10 @@ function extractDay(fragment: string, arrivedAt: number): number | null {
     if (t === "idag" || approxToken(t, "tanaan") || approxToken(t, "today")) return arrDay
   }
 
-  const weekdayDefs: ReadonlyArray<{ wd: number; exact: readonly string[]; stems: readonly string[] }> = [
-    { wd: 0, exact: ["ma", "man", "mon"], stems: ["maanant", "mandag", "monday"] },
-    { wd: 1, exact: ["ti", "tis", "tue", "tues"], stems: ["tiist", "tisdag", "tuesday"] },
-    { wd: 2, exact: ["ke", "ons", "wed"], stems: ["keskiv", "onsdag", "wednesday"] },
-    { wd: 3, exact: ["to", "tor", "tors", "thu", "thur", "thurs"], stems: ["torst", "torsdag", "thursday"] },
-    { wd: 4, exact: ["pe", "fre", "fri"], stems: ["perjant", "fredag", "friday"] },
-    { wd: 5, exact: ["la", "lor", "sat"], stems: ["lauant", "lordag", "saturday"] },
-    { wd: 6, exact: ["su", "son", "sun"], stems: ["sunnunt", "sondag", "sunday"] },
-  ]
-
   for (let idx = 0; idx < toks.length; idx++) {
     const t = toks[idx]!
-    // Prevent Swedish "först" ("forst") or "first" from matching Thursday ("torst")!
     if (t === "forst" || t === "forsta" || t === "first") continue
-    for (const def of weekdayDefs) {
+    for (const def of WEEKDAY_DEFS) {
       let matched = false
       if (def.exact.includes(t)) {
         if (t === "to") {
@@ -378,7 +414,7 @@ function extractCorrectedRange(clause: string): { opens: number; closes: number 
 
 function extractDayAndClock(clause: string, arrivedAt: number): number | null {
   const { base, corr } = splitCorrection(clause)
-  const arrDay = Math.floor(arrivedAt / DAY_MINUTES)
+  const arrDay = dayOf(arrivedAt)
   const baseDay = extractDay(base, arrivedAt)
   const baseMin = extractClockMinutes(base)
   const corrDay = corr ? extractDay(corr, arrivedAt) : null
@@ -387,7 +423,7 @@ function extractDayAndClock(clause: string, arrivedAt: number): number | null {
   const finalMin = corrMin ?? baseMin
   if (finalMin === null) return null
   const finalDay = corrDay ?? baseDay ?? arrDay
-  return finalDay * DAY_MINUTES + finalMin
+  return finalDay * DAY + finalMin
 }
 
 function extractCorrectedMinutes(clause: string): number | null {
@@ -397,49 +433,48 @@ function extractCorrectedMinutes(clause: string): number | null {
   return corrMin ?? baseMin
 }
 
-/** Shifts a dealer deadline forward by `shift` business days (skipping Sat/Sun, capped at last Monday). */
-export function shiftDeadlineBusinessDays(deadline: number, shift: number): number {
-  if (shift <= 0) return deadline
-  let day = Math.floor(deadline / DAY_MINUTES)
-  const tod = deadline % DAY_MINUTES
-  let rem = shift
-  while (rem > 0) {
-    day++
-    const wd = ((day % 7) + 7) % 7
-    if (wd !== 5 && wd !== 6) rem--
+function detectSummerTyres(strippedClauses: readonly string[], rawNoteText: string): boolean {
+  let summer = false
+  for (const sc of strippedClauses.flatMap((s) => s.split(","))) {
+    const fsc = foldAscii(sc)
+    const inBoot =
+      hasAnyStem(fsc, ["boot", "back"], [
+        "takakont",
+        "tavaratil",
+        "kontissa",
+        "takapenk",
+        "kyydis",
+        "trunk",
+        "bakluck",
+        "bagag",
+        "foljer",
+        "vanteineen",
+        "vanteilla",
+        "mukaan",
+      ]) || /\bi\s+bilen\b/.test(fsc)
+    if (inBoot) continue
+    if (
+      hasAnyStem(fsc, [], ["kesarenk", "kesareng", "kesakum", "sommardack", "sommargum"]) ||
+      (hasAnyStem(fsc, [], ["summer"]) && hasAnyStem(fsc, [], ["tyres", "tires"]))
+    ) {
+      summer = true
+    }
   }
-  return Math.min(7 * DAY_MINUTES + tod, day * DAY_MINUTES + tod)
+  const rawFoldedNote = foldAscii(rawNoteText)
+  if (
+    /\b(?:talvirenk|vinterdack)[a-z]*\s+(?:ei|inte)\b/.test(rawFoldedNote) ||
+    /\bwinter\s+t[yi]res?\s+(?:not|haven\s*t|havent)\b/.test(rawFoldedNote)
+  ) {
+    summer = true
+  }
+  return summer
 }
 
 /** Validated across 14,487 revealed legs (100.000% precision & recall on all 8 ground-truth fields). */
 export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
   const note = request.note
   const maxOptionDeadline = Math.max(...request.options.map((o) => o.deadline))
-
-  const resultLegs: ParsedLegNote[] = request.legs.map((leg) => ({
-    readyAt: leg.pickup.window.from,
-    releasedAt: null,
-    pickupHours: leg.pickup.hours
-      ? {
-          opens: leg.pickup.hours.opens,
-          closes: leg.pickup.hours.closes,
-          weekdays: [...leg.pickup.hours.weekdays],
-          saturday: leg.pickup.hours.saturday ? { ...leg.pickup.hours.saturday } : null,
-        }
-      : null,
-    deliveryHours: leg.delivery.hours
-      ? {
-          opens: leg.delivery.hours.opens,
-          closes: leg.delivery.hours.closes,
-          weekdays: [...leg.delivery.hours.weekdays],
-          saturday: leg.delivery.hours.saturday ? { ...leg.delivery.hours.saturday } : null,
-        }
-      : null,
-    manualGearbox: false,
-    needsPlates: false,
-    summerTyres: false,
-    noteDeadline: null,
-  }))
+  const resultLegs = request.legs.map((leg) => createDefaultLegNote(leg, true))
 
   if (!note || !note.text.trim() || resultLegs.length === 0) return resultLegs
 
@@ -453,13 +488,11 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
   const strippedClauses = clauses.map((c) => stripNumericNoise(stripNegations(c)))
   const fullNoNeg = strippedClauses.join(" . ")
 
-  // 1. manualGearbox
   const manualCheckText = foldAscii(fullNoNeg).replace(/\b(?:ei|not|no|inte)\s+man[a-z]+\b/g, " ")
   if (/\bstick\s+shift\b/.test(manualCheckText) || hasAnyStem(manualCheckText, [], ["manuaal", "manual", "manuell", "kasivaiht"])) {
     leg0.manualGearbox = true
   }
 
-  // 2. needsPlates
   const plateToks = tokenizeFolded(fullNoNeg)
   if (
     plateToks.some(
@@ -483,42 +516,10 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
     leg0.needsPlates = true
   }
 
-  // 3. summerTyres (mounted on car, NOT extra tyres in boot/trunk/tavaratilassa)
-  for (const sc of strippedClauses.flatMap((s) => s.split(","))) {
-    const fsc = foldAscii(sc)
-    const inBoot =
-      hasAnyStem(fsc, ["boot", "back"], [
-        "takakont",
-        "tavaratil",
-        "kontissa",
-        "takapenk",
-        "kyydis",
-        "trunk",
-        "bakluck",
-        "bagag",
-        "foljer",
-        "vanteineen",
-        "vanteilla",
-        "mukaan",
-      ]) || /\bi\s+bilen\b/.test(fsc)
-    if (inBoot) continue
-    if (
-      hasAnyStem(fsc, [], ["kesarenk", "kesareng", "kesakum", "sommardack", "sommargum"]) ||
-      (hasAnyStem(fsc, [], ["summer"]) && hasAnyStem(fsc, [], ["tyres", "tires"]))
-    ) {
-      leg0.summerTyres = true
-    }
-  }
-  // Also catch "talvirenkaita ei vielä vaihdettu" / "winter tyres not yet changed" (negated winter-tyre swap!)
-  const rawFoldedNote = foldAscii(note.text)
-  if (
-    /\b(?:talvirenk|vinterdack)[a-z]*\s+(?:ei|inte)\b/.test(rawFoldedNote) ||
-    /\bwinter\s+t[yi]res?\s+(?:not|haven\s*t|havent)\b/.test(rawFoldedNote)
-  ) {
+  if (detectSummerTyres(strippedClauses, note.text)) {
     leg0.summerTyres = true
   }
 
-  // 4. Clause-by-clause parsing for releasedAt, noteDeadline, deliveryHours, pickupHours, readyAt
   for (const clause of clauses) {
     const { rawClean } = splitCorrection(clause)
     const fc = foldAscii(rawClean)
@@ -527,14 +528,12 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       continue
     }
 
-    // 4a. Payment release (`releasedAt`)
     if (hasAnyStem(fc, ["pays", "paid"], ["maksu", "maksaa", "maksettu", "rahoitus", "payment", "betal"])) {
       const t = extractDayAndClock(clause, request.arrivedAt)
       if (t !== null) leg0.releasedAt = leg0.releasedAt === null ? t : Math.max(leg0.releasedAt, t)
       continue
     }
 
-    // 4b. Tighter delivery deadline (`noteDeadline`)
     const isCustomerPickupAtDest =
       (hasAnyStem(fc, [], ["asiakas", "customer", "kunden"]) &&
         hasAnyStem(fc, [], ["hakemaan", "noutaa", "hamtar", "perill", "there"])) ||
@@ -558,7 +557,6 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       continue
     }
 
-    // 4c. Delivery opening hours (`deliveryHours`)
     const fcTokens = tokenizeFolded(rawClean)
     const hasKohde = fcTokens.some(
       (t) => t !== "kohta" && !t.startsWith("kaht") && !t.startsWith("kahd") && (approxToken(t, "kohde") || approxPrefix(t, "kohte")),
@@ -583,7 +581,6 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       continue
     }
 
-    // 4d. Pickup opening hours range (`pickupHours`)
     const rng = extractCorrectedRange(clause)
     if (rng) {
       if (leg0.pickupHours && !reqLeg0.pickup.privateAddress) {
@@ -593,12 +590,10 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       continue
     }
 
-    // 4e. Pickup closing hour (`pickupHours.closes`)
     const isNotBefore =
       /\b(?:ei\s+ennen|not\s+before|not\s+ready\s+before|inte\s+fore|inte\s+klar\s+forran|wont\s+be\s+ready\s+until)\b/.test(
         fc.replace(/'/g, ""),
       )
-
     const hasExplicitLatest =
       hasAnyStem(fc, [], ["viimeist", "senast", "latest"]) || /\bno\s+later\s+than\b/.test(fc)
     const hasReadyWord = hasAnyStem(fc, ["klar", "ready"], ["valmi"])
@@ -624,7 +619,6 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       continue
     }
 
-    // 4f. Car ready time (`readyAt`)
     if (hasAnyStem(fc, ["heti", "now", "away", "direkt"], ["pihalla"]) && extractClockMinutes(rawClean) === null) {
       continue
     }
