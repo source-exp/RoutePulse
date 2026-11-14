@@ -788,9 +788,18 @@ class Desk {
       case "order_cancelled":
         this.handleOrderCancelled(event.orderId, event.gigs)
         break
-      case "gig_viewed":
+      case "gig_viewed": {
         this.offers.recordView(event.driverId, event.at, event.gigId)
+        const vg = this.gigs.get(event.gigId)
+        if (vg && vg.status === "open" && this.now >= vg.postedAt + 8) {
+          const vCount = this.offers.gigViewers.get(event.gigId)?.get(event.driverId)?.count ?? 0
+          if (vCount >= 2) {
+            vg.nextOfferCheckAt = Math.min(vg.nextOfferCheckAt, this.now + 1)
+            this.needsImmediateOfferPass = true
+          }
+        }
         break
+      }
       case "gig_booked":
         this.handleGigBooked(event.gigId, event.driverId, event.feeCents, event.at)
         break
@@ -1053,11 +1062,28 @@ class Desk {
 
     const displacedPartners = this.removeUnsentPostsForOrder(order.id)
     const openGigsToWithdraw = new Set<string>()
+    const bookedGigsToRelease = new Set<string>()
     const m = this.legGigs.get(order.id)
     if (m) {
-      for (const gid of m.values()) {
+      for (const [legIdx, gid] of m.entries()) {
         const g = this.gigs.get(gid)
-        if (g && g.status === "open") openGigsToWithdraw.add(gid)
+        if (!g) continue
+        if (g.status === "open") {
+          openGigsToWithdraw.add(gid)
+        } else if (g.status === "booked") {
+          // If order_changed rerouted a <30% EV across >200km on a booked gig without withCharging,
+          // release & repost with withCharging: true to avoid the -€100 EV fine + 90m late penalty!
+          const legObj = order.legs[legIdx]
+          const pStop = g.stops.find((s) => s.kind === "pickup" && s.orderId === order.id && s.leg === legIdx)
+          if (
+            legObj &&
+            pStop &&
+            !pStop.withCharging &&
+            this.map.needsCharging(legObj.car, legObj.pickup.placeId, legObj.delivery.placeId)
+          ) {
+            bookedGigsToRelease.add(gid)
+          }
+        }
       }
     }
 
@@ -1072,6 +1098,16 @@ class Desk {
       g.status = "withdrawn"
       this.unlinkGig(gid)
       this.outbox.push({ type: "withdraw", gigId: gid })
+    }
+
+    for (const gid of bookedGigsToRelease) {
+      const g = this.gigs.get(gid)!
+      for (const o of this.distinctLiveOrdersOfStops(g.stops)) {
+        if (o.id !== order.id) partnerOrders.add(o.id)
+      }
+      g.status = "withdrawn"
+      this.unlinkGig(gid)
+      this.outbox.push({ type: "release", gigId: gid })
     }
 
     const missingSelf = undeliveredLegs(order).filter((leg) => !this.legGigs.get(order.id)?.has(leg))
@@ -1197,6 +1233,28 @@ class Desk {
     this.offers.clearGig(gigId)
 
     if (g.isBundledTwoOrder) {
+      // Keep dropped bundles open on the board when ample slack (>=320m) remains (+€373/wk saved vs shattering)!
+      const bOrders = this.distinctLiveOrdersOfStops(g.stops)
+      const minBundleLpa =
+        bOrders.length > 0
+          ? Math.min(...bOrders.map((o) => this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt))
+          : -Infinity
+      if (
+        bOrders.length >= 2 &&
+        minBundleLpa - this.now >= 320 &&
+        bOrders.every((o) => !this.urgent.has(o.id))
+      ) {
+        const bumped = g.schedule.map((s, idx) => ({
+          at: idx === 0 ? this.now : Math.max(this.now + idx * 25, s.at),
+          feeCents: Math.round(s.feeCents * 1.03),
+        }))
+        g.schedule = bumped
+        g.splitAt = Math.min(this.now + 115, minBundleLpa - 230)
+        g.offerWave++
+        g.nextOfferCheckAt = this.now + 10
+        this.outbox.push({ type: "reprice", gigId: g.id, schedule: bumped })
+        return
+      }
       this.splitOpenBundle(g)
       return
     }
@@ -1220,11 +1278,31 @@ class Desk {
 
   private handleDriverLate(gigId: string, pickupAt: number): void {
     const g = this.gigs.get(gigId)
-    if (!g || g.status !== "booked" || g.isBundledTwoOrder) return
+    if (!g || g.status !== "booked") return
     const p0 = g.stops[0]
     if (!p0) return
     const order = this.orders.get(p0.orderId)
     if (!order) return
+
+    if (g.isBundledTwoOrder) {
+      const bOrders = this.distinctLiveOrdersOfStops(g.stops)
+      const minEffLpa =
+        bOrders.length > 0
+          ? Math.min(...bOrders.map((o) => this.effectiveLastPickupByOrder.get(o.id) ?? o.lastPickupAt))
+          : -Infinity
+      const missesStop0Cap = p0.window !== undefined && pickupAt > p0.window.to
+      if (missesStop0Cap && minEffLpa - this.now >= 140) {
+        g.status = "withdrawn"
+        this.unlinkGig(gigId)
+        this.outbox.push({ type: "release", gigId })
+        for (const bo of bOrders) {
+          this.doNotBundle.add(bo.id)
+          const missing = undeliveredLegs(bo).filter((l) => !this.legGigs.get(bo.id)?.has(l))
+          if (missing.length > 0) this.dispatchOrderLegs(bo, missing, false)
+        }
+      }
+      return
+    }
 
     const leg0 = order.legs[p0.leg]
     if (!leg0) return

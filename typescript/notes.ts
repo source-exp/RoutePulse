@@ -73,17 +73,33 @@ function hasAnyStem(text: string, exactShort: readonly string[], stemsLong: read
   return false
 }
 
+function startsWithProtectedAfterNeg(rest: string): boolean {
+  const toks = tokenizeFolded(rest)
+  const first = toks[0]
+  if (!first) return false
+  if (first === "kun" || first === "fore" || first === "ready" || first === "klar") return true
+  if (
+    approxPrefix(first, "ennen") ||
+    approxPrefix(first, "before") ||
+    approxPrefix(first, "forran") ||
+    approxPrefix(first, "valmi") ||
+    approxPrefix(first, "ready")
+  ) {
+    return true
+  }
+  return false
+}
+
 function stripNegations(clause: string): string {
-  const keepAfterNeg = /\s*(?:kun\b|ennen\b|before\b|fore\b|förrän\b|forran\b|ready\b|valmi\w*|klar\b)/i
   let s = clause.replace(/\(\s*(?:not|no|ei|inte)\b([^)]*)\)/gi, (full, rest: string) =>
-    keepAfterNeg.test(rest) ? full : " ",
+    startsWithProtectedAfterNeg(rest) ? full : " ",
   )
   // Strip negated contrast prefix before vaan/utan/but (e.g. "ei klo 12 vaan klo 15" -> " klo 15")
   s = s.replace(/(?:^|[,\s])\b(?:not|ei|inte)\b([^,.;!?]*?)\b(?:vaan|utan|but)\b/gi, (full, rest: string) =>
-    keepAfterNeg.test(rest) ? full : " ",
+    startsWithProtectedAfterNeg(rest) ? full : " ",
   )
   s = s.replace(/,\s*(?:not|ei|inte)\b([^,.;!?]*)/gi, (full, rest: string) => {
-    if (keepAfterNeg.test(rest) || /\b(?:vaan|utan|men|but)\b/i.test(rest)) return full
+    if (startsWithProtectedAfterNeg(rest) || /\b(?:vaan|utan|men|but)\b/i.test(rest)) return full
     return " "
   })
   return s
@@ -115,8 +131,15 @@ const WORD_HOUR_STEMS: ReadonlyArray<{ hour: number; stems: readonly string[]; e
 ]
 
 function matchWordHourToken(tok: string): number | null {
+  // Pass 1: exact token or exact stem prefix first (prevents "yhdesta"=13 matching "yhdeks"=9 via fuzzy edit!)
   for (const entry of WORD_HOUR_STEMS) {
     if (entry.exact.includes(tok)) return entry.hour
+    for (const st of entry.stems) {
+      if (tok.startsWith(st) && !(entry.hour >= 13 && tok.length >= 11)) return entry.hour
+    }
+  }
+  // Pass 2: typo-tolerant prefix match
+  for (const entry of WORD_HOUR_STEMS) {
     for (const st of entry.stems) {
       if (approxPrefix(tok, st)) return entry.hour
     }
@@ -187,6 +210,8 @@ function extractDay(fragment: string, arrivedAt: number): number | null {
 
   for (let idx = 0; idx < toks.length; idx++) {
     const t = toks[idx]!
+    // Prevent Swedish "först" ("forst") or "first" from matching Thursday ("torst")!
+    if (t === "forst" || t === "forsta" || t === "first") continue
     for (const def of weekdayDefs) {
       let matched = false
       if (def.exact.includes(t)) {
@@ -448,11 +473,19 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
       ]) || /\bi\s+bilen\b/.test(fsc)
     if (inBoot) continue
     if (
-      hasAnyStem(fsc, [], ["kesarenk", "kesareng", "sommardack"]) ||
+      hasAnyStem(fsc, [], ["kesarenk", "kesareng", "kesakum", "sommardack", "sommargum"]) ||
       (hasAnyStem(fsc, [], ["summer"]) && hasAnyStem(fsc, [], ["tyres", "tires"]))
     ) {
       leg0.summerTyres = true
     }
+  }
+  // Also catch "talvirenkaita ei vielä vaihdettu" / "winter tyres not yet changed" (negated winter-tyre swap!)
+  const rawFoldedNote = foldAscii(note.text)
+  if (
+    /\b(?:talvirenk|vinterdack)[a-z]*\s+(?:ei|inte)\b/.test(rawFoldedNote) ||
+    /\bwinter\s+t[yi]res?\s+(?:not|haven\s*t|havent)\b/.test(rawFoldedNote)
+  ) {
+    leg0.summerTyres = true
   }
 
   // 4. Clause-by-clause parsing for releasedAt, noteDeadline, deliveryHours, pickupHours, readyAt
@@ -465,7 +498,7 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
     }
 
     // 4a. Payment release (`releasedAt`)
-    if (hasAnyStem(fc, ["pays"], ["maksu", "maksaa", "maksettu", "rahoitus", "payment", "betalning"])) {
+    if (hasAnyStem(fc, ["pays", "paid"], ["maksu", "maksaa", "maksettu", "rahoitus", "payment", "betal"])) {
       const t = extractDayAndClock(clause, request.arrivedAt)
       if (t !== null) leg0.releasedAt = leg0.releasedAt === null ? t : Math.max(leg0.releasedAt, t)
       continue
@@ -536,7 +569,8 @@ export function parseDealerNote(request: PriceRequest): ParsedLegNote[] {
 
     const isPickupClose =
       !isNotBefore &&
-      (hasAnyStem(fc, [], ["saakka", "until", "sulke", "stang", "kiinni", "closes", "ketaan"]) ||
+      (hasAnyStem(fc, ["asti"], ["saakka", "until", "sulke", "stang", "kiinni", "closes", "ketaan"]) ||
+        /\boppet\b[^.!?]*\btill\b/.test(fc) ||
         /\bwe\s+close\b/.test(fc) ||
         /\bshop\s+close/.test(fc) ||
         /\bingen\s+utlamning\b/.test(fc) ||

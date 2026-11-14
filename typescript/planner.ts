@@ -504,18 +504,43 @@ export function buildStopsForOrder(
           }
         }
 
-        // Guard standard dealer stops against picking up 1-5m before raw lastPickupAt and missing 20:00 by drive variance
-        if (
-          !omitSoftPickupCap &&
-          idx === legIndices[0] &&
-          effectiveLastPickupAt < order.lastPickupAt &&
-          effectiveLastPickupAt > Math.max(now + 75, minStart + 30)
-        ) {
-          const curFrom = pickupStop.window?.from ?? minStart
-          const curTo = pickupStop.window?.to ?? order.deadline
-          const cappedTo = Math.min(curTo, effectiveLastPickupAt)
-          if (cappedTo >= curFrom + 20) {
-            pickupStop.window = { from: Math.max(leg.pickup.window.from, curFrom), to: cappedTo }
+        // Guard standard dealer stops against picking up 1-5m before raw lastPickupAt and missing 20:00 by drive variance,
+        // AND even when omitSoftPickupCap is true, always enforce the physical end-of-world arrival cutoff before endsAt!
+        if (idx === legIndices[0]) {
+          const lastLegObj = order.legs[legIndices[legIndices.length - 1]!]!
+          const lastNoteObj = notes[legIndices[legIndices.length - 1]!]
+          const lastDelivH = lastNoteObj?.deliveryHours ?? lastLegObj.delivery.hours
+          const totRoad = legIndices.reduce(
+            (s, li) => s + map.roadMinutes(order.legs[li]!.pickup.placeId, order.legs[li]!.delivery.placeId),
+            0,
+          )
+          const extraM = (withCharging ? CHARGING_MINUTES : 0) + (withPlates ? PLATES_MINUTES : 0)
+          const endWorldDeliv = latestOpenBefore(endsAt, lastDelivH, 15)
+          const endWorldPickCap = endWorldDeliv - Math.ceil(totRoad * 1.06) - extraM - 20
+
+          if (
+            !omitSoftPickupCap &&
+            effectiveLastPickupAt < order.lastPickupAt &&
+            effectiveLastPickupAt > Math.max(now + 75, minStart + 30)
+          ) {
+            const curFrom = pickupStop.window?.from ?? minStart
+            const curTo = pickupStop.window?.to ?? order.deadline
+            const cappedTo = Math.min(curTo, effectiveLastPickupAt)
+            if (cappedTo >= curFrom + 20) {
+              pickupStop.window = { from: Math.max(leg.pickup.window.from, curFrom), to: cappedTo }
+            }
+          } else if (
+            omitSoftPickupCap &&
+            Number.isFinite(endWorldPickCap) &&
+            endWorldPickCap < endsAt - 30 &&
+            endWorldPickCap > Math.max(now + 45, minStart + 25)
+          ) {
+            const curFrom = pickupStop.window?.from ?? minStart
+            const curTo = pickupStop.window?.to ?? endsAt - 30
+            const cappedTo = Math.min(curTo, endWorldPickCap)
+            if (cappedTo >= curFrom + 20) {
+              pickupStop.window = { from: Math.max(leg.pickup.window.from, curFrom), to: cappedTo }
+            }
           }
         }
       }

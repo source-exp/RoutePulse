@@ -603,7 +603,7 @@ export function evaluateMenuChoice(
       winNd += du * (1 - sSd) * (1 - s3d)
     } else if (wSd && wNd) {
       const sSd = sigmoid(4.8 * (0.092 - Math.log(rSd / rNd)))
-      const k3d = has3dOffered ? sigmoid(7.5 * (0.32 - Math.log(rNd / 0.93))) : 1.0
+      const k3d = has3dOffered && rNd > 1.08 ? sigmoid(6.0 * (0.42 - Math.log(rNd / 0.93))) : 1.0
       winSd += du * sSd
       winNd += du * (1 - sSd) * k3d
     } else if (wNd && w3d) {
@@ -621,7 +621,7 @@ export function evaluateMenuChoice(
       winSd += du * kNd
     } else if (wNd) {
       const kSd = hasSdOffered ? 1 - sigmoid(4.8 * (0.092 - Math.log(1.08 / rNd))) : 1.0
-      const k3d = has3dOffered ? sigmoid(7.5 * (0.32 - Math.log(rNd / 0.93))) : 1.0
+      const k3d = has3dOffered && rNd > 1.08 ? sigmoid(6.0 * (0.42 - Math.log(rNd / 0.93))) : 1.0
       winNd += du * kSd * k3d
     } else if (w3d) {
       const kFast = hasNdOffered
@@ -739,8 +739,9 @@ export class PricingEngine {
     if (dayLoad >= 1.05 && option.kind === "same_day") return undefined
     if (dayLoad >= 1.20) return undefined
 
-    // Safety gates against zero-notification traps
+    // Safety gates against zero-notification traps & isolated Arctic 2-driver dead-zones
     if (plan.premiumAny && Q30 === 0 && (Q65 < 10 || leadHours < 12)) return undefined
+    if (Q65 <= 3 && plan.totalRoadKm > 450 && leadHours < 36) return undefined
     if (plan.privateDeliveryCount > 0 && request.legs.length === 1 && (Q65 < 6 || leadHours < 3.5)) return undefined
     if (leadHours < 2.0 && Q30 < 25) return undefined
 
@@ -897,11 +898,10 @@ export class PricingEngine {
     const expectedRiskCost = pLate * (0.35 * option.listPriceCents * 1.45 + franchiseLossCents)
     const trueCostCents = expectedDriverFee + expectedRiskCost
 
-    // Health-adaptive targetWeekly + Hybrid Per-Slot Shadow Cost
     const drv = this.supply.totalDrivers
     const baseTargetWeekly =
       this.level >= 7
-        ? Math.max(275, Math.min(465, Math.round(drv * (0.425 + 0.00018 * Math.max(0, drv - 680)))))
+        ? Math.max(275, Math.min(445, Math.round(drv * (0.42 + 0.00016 * Math.max(0, drv - 690)))))
         : Math.max(450, Math.min(640, Math.round(drv * 0.26)))
 
     const softBacklog = Math.max(10, drv * 0.030)
@@ -911,9 +911,9 @@ export class PricingEngine {
         ? Math.max(
             0.86,
             Math.min(
-              1.12,
+              1.08,
               1.0 +
-                0.12 * Math.max(0, Math.min(1, (currentOnTime - 0.952) / 0.025)) * Math.max(0, 1 - backlogExcess) -
+                0.08 * Math.max(0, Math.min(1, (currentOnTime - 0.955) / 0.025)) * Math.max(0, 1 - backlogExcess) -
                 0.10 * Math.min(1.4, backlogExcess) -
                 (currentOnTime < 0.942 ? 2.8 * (0.942 - currentOnTime) : 0) -
                 (ctx.fluActiveToday ? 0.07 : 0),
@@ -1269,9 +1269,11 @@ export class PricingEngine {
         : Math.max(400, Math.round(sdB.effCost - ndB.effCost + 150))
 
       let curNd = soloNd.p
-      let curSd = Math.max(sdB.minP, curNd + minSdSpread)
+      const sdPctFloor = isThuFriBypass ? 0 : Math.round(curNd * 1.12)
+      let curSd = Math.max(sdB.minP, curNd + minSdSpread, sdPctFloor)
       for (let pass = 0; pass < 2; pass++) {
-        const loSd = Math.max(sdB.minP, curNd + minSdSpread)
+        const dynPctFloor = isThuFriBypass ? 0 : Math.round(curNd * 1.12)
+        const loSd = Math.max(sdB.minP, curNd + minSdSpread, dynPctFloor)
         const hiSd = Math.max(loSd + 200, sdB.maxP)
         let optSdP = curSd
         let optEv = -1e9
@@ -1287,7 +1289,8 @@ export class PricingEngine {
         curSd = optSdP
 
         const loNd = ndB.minP
-        const hiNd = Math.min(ndB.maxP, curSd - minSdSpread)
+        const hiNdByPct = isThuFriBypass ? Infinity : Math.floor(curSd / 1.12)
+        const hiNd = Math.min(ndB.maxP, curSd - minSdSpread, hiNdByPct)
         if (hiNd >= loNd) {
           let optNdP = curNd
           optEv = -1e9

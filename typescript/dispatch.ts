@@ -124,8 +124,8 @@ export function buildSingleGigSchedule(
     return [{ at: ctx.now, feeCents: Math.max(1, fee) }]
   }
 
-  // True End-of-World Undelivered Rescue (final 52h before Wed 22:00 endsAt, covering Last Monday 20:31!): guarantee 0.0% undelivered!
-  if (ctx.isPastDeadline && ctx.endsAt - ctx.now <= 52 * HOUR) {
+  // True End-of-World Undelivered Rescue (final 42h before Wed 22:00 endsAt = Final Tue 04:00 onward!): guarantee 0.0% undelivered!
+  if (ctx.isPastDeadline && ctx.endsAt - ctx.now <= 42 * HOUR) {
     const rescueMults = [
       Math.max(m0 + 0.45, 1.58),
       Math.max(m0 + 0.75, 1.88),
@@ -147,7 +147,7 @@ export function buildSingleGigSchedule(
   // Rule-4 Mid-Week Already-Late Regime (now > rawLastPickupAt on non-private delivery, >42h before endsAt):
   // On-time delivery is already impossible and delivering tonight at a closed dealer gate vs tomorrow daytime
   // pays the EXACT SAME 25% (<24h) refund! Pace daytime steps calmly instead of gifting 2.40x-3.00x overnight.
-  if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 52 * HOUR) {
+  if ((ctx.isPastDeadline || ctx.now > ctx.rawLastPickupAt) && !ctx.hasPrivateDelivery && ctx.endsAt - ctx.now > 42 * HOUR) {
     const lateDayMults = [
       Math.max(m0 + 0.10, 1.05),
       Math.max(m0 + 0.24, 1.20),
@@ -410,20 +410,46 @@ function evaluateOrderedBundle(
   const mktMult = 1.0 + (snow1 || snow2 ? 0.10 : 0) + (fluActive ? 0.08 : 0)
   const coeffs = tier === 1 ? [0.58, 0.66, 0.75, 0.85] : [0.66, 0.74, 0.83, 0.93]
 
+  const crossesNightBundle = Math.floor(minLastPickup / DAY) > Math.floor(now / DAY) && minLastPickup - now >= 600
+  const lpaDayStart = Math.floor(minLastPickup / DAY) * DAY
+
   const schedule = normalizeSteps(
-    coeffs.map((c, k) => ({
-      at: k === 0 ? now : clampOutOfNight(now + k * 30, k),
-      feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),
-    })),
+    coeffs.map((c, k) => {
+      const rawStepAt =
+        k === 0
+          ? now
+          : crossesNightBundle && k >= 2
+            ? Math.max(now + k * 35, lpaDayStart + 7 * HOUR + 15 + (k - 2) * 50)
+            : clampOutOfNight(now + k * 30, k)
+      return {
+        at: rawStepAt,
+        feeCents: Math.round(Math.max(c * refSum, (0.90 + 0.08 * k) * refMax) * mktMult),
+      }
+    }),
     now,
   )
 
-  const crossesNightBundle = Math.floor(minLastPickup / DAY) > Math.floor(now / DAY) && minLastPickup - now >= 600
-  const lpaDayStart = Math.floor(minLastPickup / DAY) * DAY
   const splitAt = crossesNightBundle
     ? Math.min(minLastPickup - 240, Math.max(now + 150, lpaDayStart + 9 * HOUR + 15))
     : Math.min(now + 125, minLastPickup - 210)
   if (splitAt <= now + 35) return undefined
+
+  // Propagate Order 2's latest pickup backward onto Order 1's pickup stop so a booked driver
+  // can NEVER pick up Order 1 late afternoon and miss Order 2's 18:00 pickup closing hour!
+  const maxP1ForP2 = b.built.effectiveLastPickupAt - driveDh - 15 - drive1 - extra1 - 15
+  const bundleStops = [...a.built.stops, ...b.built.stops]
+  if (
+    maxP1ForP2 >= Math.max(now + 45, p1From + 20) &&
+    maxP1ForP2 < (p1Stop.window?.to ?? a.order.deadline)
+  ) {
+    bundleStops[0] = {
+      ...p1Stop,
+      window: {
+        from: Math.max(leg1.pickup.window.from, p1From),
+        to: Math.min(p1To, maxP1ForP2),
+      },
+    }
+  }
 
   const expectedSavings = refSum - schedule[0]!.feeCents
   const hubBonus = Math.min(600, poolP1 * 2) - dh * 12 - ret * 6
@@ -433,7 +459,7 @@ function evaluateOrderedBundle(
     plan: {
       firstOrderId: a.order.id,
       secondOrderId: b.order.id,
-      stops: [...a.built.stops, ...b.built.stops],
+      stops: bundleStops,
       audience: { experienced: false, manualLicence },
       schedule,
       tier,
@@ -857,12 +883,12 @@ export class DirectOfferTracker {
       }
 
       const vInfo = this.gigViewers.get(gig.gigId)?.get(d.id)
-      const isRepeatViewer = Boolean(vInfo && vInfo.count >= 2 && now - vInfo.lastAt <= 60)
-      const isSingleViewer = Boolean(vInfo && vInfo.count === 1 && now - vInfo.lastAt <= 90)
+      const isRepeatViewer = Boolean(vInfo && vInfo.count >= 2 && now - vInfo.lastAt <= 45)
+      const isSingleViewer = Boolean(vInfo && vInfo.count === 1 && now - vInfo.lastAt <= 45)
 
-      // Tight activity horizon: eliminates 70%+ of unread expired offers
-      const maxInactiveMins = vInfo ? 150 : isUrgent || isScarce ? 140 : 65
-      if (!workedToday && !chained && minsSinceAct > maxInactiveMins) continue
+      // Strict live-session activity horizon: stops burning 3/day offer quotas on drivers who closed the app!
+      const maxInactiveMins = vInfo ? 45 : isUrgent || isScarce ? 120 : 45
+      if (!chained && minsSinceAct > maxInactiveMins) continue
 
       const distP = map.distKm(d.homePlaceId, gig.pickupPlaceId)
       const distD = map.distKm(d.homePlaceId, gig.deliveryPlaceId)
@@ -946,11 +972,15 @@ export class DirectOfferTracker {
         if (isUrgent && slackMin <= 190) {
           feeCents = Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
         } else if (isRepeatViewer) {
-          const sweet = Math.round(gig.currentAppFeeCents * 1.07)
-          feeCents = Math.max(sweet, Math.min(rawFee, Math.round(gig.refFeeCents * 1.20)))
+          // Nudge active repeat viewer +6%..+12% above live app fee instead of overpaying rawFee (+20%)!
+          const floorSweet = Math.round(gig.currentAppFeeCents * 1.06)
+          const capSweet = Math.round(gig.currentAppFeeCents * 1.13)
+          feeCents = Math.max(floorSweet, Math.min(rawFee, capSweet))
         } else if (isSingleViewer) {
-          const sweet = Math.round(gig.currentAppFeeCents * 1.04)
-          feeCents = Math.max(sweet, rawFee)
+          // Nudge active 1st-view holdout +3%..+9% above live app fee (stops +19.7% overpayment leak!)
+          const floorSweet = Math.round(gig.currentAppFeeCents * 1.03)
+          const capSweet = Math.round(gig.currentAppFeeCents * 1.09)
+          feeCents = Math.max(floorSweet, Math.min(rawFee, capSweet))
         } else if (chained) {
           feeCents = Math.max(rawFee, Math.round(gig.currentAppFeeCents * 0.92))
         } else {
