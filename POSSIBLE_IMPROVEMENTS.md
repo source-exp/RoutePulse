@@ -269,6 +269,43 @@ We queried the full server reveals (`reveal()`, `events()`, `snapshot()`) of all
 | **5 (HIGH)** | `P0-10`, `P1-10`, `P1-11`, `P1-12` | `market.ts` | Fix Price-War double-discount/overshoot, `noDayLogC` 80km outage detector, `dlDay = 7` capacity cap, per-slot shadow unit, `equalMargin3d` tautology, trade-in turnaround | **+€2,000 to +€3,800/wk pricing uplift** |
 | **6 (MED)** | `P1-2`, `P1-6`, `P1-8`, `P2-1` | `dispatch.ts`, `market.ts`, `notes.ts` | Tighten 3-car bundle gate & preserve 2-car bundle on split, long-haul northern sink surcharge, `pool30` suburb fix (`lempaala`/`raisio`), `"sorry, i mean"` note rule | **+€1,000 to +€1,800/wk & 100.0% notes** |
 
+---
+
+## Pass 8 — Untapped Game Mechanics, Live Operations & Jury Strategy
+
+### S1 [UNTAPPED MECHANIC — `45%–51%` OF MARKET]: Joint Batch Optimization via `request.batchId` (`types.ts:131`, `starter.ts:581`)
+- **Empirical Finding Across All 4 Local Reveal Worlds:**
+  - `reveal-baseline-spread-1`: **440 batched requests** across 119 batches (largest: `B0119 = 37`, `B0059 = 25`, `B0012 = 22`).
+  - `reveal-study-a`: **529 batched requests** across 154 batches (largest: `B0154 = 34`, `B0139 = 16`, `B0016 = 15`).
+  - `reveal-study-b`: **461 batched requests** across 138 batches (largest: `B0138 = 38`, `B0103 = 21`, `B0024 = 16`).
+  - `reveal-study-c`: **432 batched requests** across 132 batches (largest: `B0132 = 33`, `B0097 = 11`, `B0011 = 10`).
+  - Currently **zero lines of production code** read `request.batchId`.
+- **Two High-Upside Uses of `batchId` / Same-Minute Arrival Buffering:**
+  1. **Batch Ranking & Progressive Single-Yard Shadow Pricing:** Because `respondBy` is `arrivedAt + 15` (and quotes can be replaced before `respondBy`), buffer all requests arriving in the same minute/batch, rank them by expected margin + destination driver-return value, price the top 8–12 outbound cars competitively, and ramp local cluster shadow cost across ranks `13..38` so a 38-car single-yard dump never starves that yard's 30-km driver pool.
+  2. **Pre-Win Simultaneous Round-Trip Detection:** Two requests `A -> B` and `B -> A` arriving in the same batch/minute currently see `hasOpenRoundTripPartner = false` because `order_won` fires 15 minutes later. Detecting complementary pairs across open requests in the current minute unlocks bundling credits *at quote time*.
+
+### S2 [SYMMETRIC ONLINE LEARNING]: Online Per-Cluster Driver Clearing-Fee Estimator (`dispatch.ts:48–95`)
+- **Why:** `CompetitorMarketEstimator` adapts online to hidden world/day/lane dealer prices, whereas driver opening multipliers (`m0` in `dispatch.ts`) are purely static.
+- **What to add:** Maintain an empirical-Bayes log-fee offset per 30-km pickup cluster updated from `gig_booked` (`bookedFee / refFee`, `bookingDelay <= 20m`) vs. 60-minute unbooked survivals. Liquid clusters smoothly drift from `0.81x` down toward `0.76x`, while invisibly starved towns lift `m0` immediately without waiting 4 hours for `warnLead`.
+
+### S3 [TEST FINALS & PRODUCTION HARDENING — SATURDAY 14:00 & 20:00, SUNDAY 08:00]:
+- **Schedule (`/judging`):**
+  - **Saturday Test Finals:** `14:00` and `20:00` Helsinki time (worlds set at `13:45` and `19:45`, ~19 minutes each, starting from Thursday `00:00`).
+  - **Sunday Live Final:** `08:00–08:35` Helsinki time (world set at `07:30`, registration closes `07:30`).
+- **Operational Checklist:**
+  1. Install/symlink `node` (v24) or `bun` into `~/.local/bin` (currently unpacked in `/tmp/opencode/...`, which is wiped on reboot).
+  2. Run `--final` inside `tmux` with automatic log teeing to `results/final-<timestamp>.log` and action-refusal counters (`{ ok: false }`).
+  3. Play **both** Saturday Test Finals (`14:00` and `20:00`) with `--final` to validate WebSocket micro-batch draining, `20/sec` `final-actions` token budgeting, and `rejoin()` under live server load.
+
+### S4 [RANKING ROUND CALIBRATION (`--board`)]:
+- Ranking rounds open Saturday at `00:00, 09:00, 12:00, 15:00, 18:00, 21:00` and Sunday at `00:00, 03:00, 06:00`.
+- Once the `P0` fixes land, run one complete 5-world Level-8 ranking round (`--board`) to verify standing against `House best` and record the **"best ranking round"** figure required for the presentation.
+
+### S5 [JURY WINNING STRATEGY — TOP 10 IS AN ELIGIBILITY GATE, JURY PICKS WINNERS]:
+- Per `/judging`, once a team finishes in the **Top 10 ranked margins** on Sunday `08:35`, **margin no longer counts** — the jury selects the winners on **Elegance, Clarity, Creativity, and Robustness** (submission closes **Sunday 10:00** on Junction: submission hash from `/team`, GitHub link, and **5–10 slides**).
+- Structure the 5–10 slides around **one claim + measured same-seed Level-8 A/B delta per slide** (*Idea $\to$ Why $\to$ Measured Effect on Margin & On-Time across the same N seeds*), plus explicit slides on **what did not work** (e.g., naive 3-car bundle cannibalization, fixed daily quote caps, aggressive flat markups) and **what would break the system**.
+
+
 
 
 
