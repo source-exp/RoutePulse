@@ -168,3 +168,27 @@ node --no-warnings src/reveal-csv.ts <worldId>
 | [`src/types.ts`](src/types.ts) | 550 | Strict TypeScript contracts matching Spread OpenAPI 3.1 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | — | Detailed formulas, state transitions, rate-limit budgets, and disruption recovery reference |
 | [`results/`](results/) | — | Complete console logs for ranking rounds, benchmark sweeps, and same-seed A/B experiments |
+
+## 8. Local Dispatch Dashboard
+
+The React + Vite dashboard visualizes the Finland route network, saved run metrics, and the order-margin calculation. It uses the Spread team key only in its local Node server; the browser never receives the key.
+
+```bash
+export SPREAD_URL=https://spread.bahnexpress.com
+export SPREAD_KEY=<your-team-key>
+cd ui
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite. Without a working team key, the dashboard replays a saved result from `results/` (or its bundled historical snapshot). Press **Simulate a run** to launch a Level-8 practice run when Spread is reachable; its complete console output is saved to a new dated file in `results/`.
+
+### Vercel hosting
+
+Deploy the repository with Vercel's **Root Directory** set to the repository root (`.`). The root `vercel.json` installs dependencies from `ui/package-lock.json`, runs the Vite build, and serves `ui/dist`; the root `api/` directory provides the Node Functions for `/api/dashboard` and `/api/simulate`.
+
+In the Vercel project's **Settings → Environment Variables**, add `SPREAD_KEY` as a server-side variable (never `VITE_SPREAD_KEY`). Set `SPREAD_URL` to the HTTPS Spread server URL as well. The hosted API rejects plaintext HTTP URLs. Do not put either value in frontend environment variables or source files.
+
+Import the repository into Vercel, select the `ui-dev` branch, confirm the Root Directory and build settings from `vercel.json`, add the environment variables for the desired deployment environments, then deploy. Subsequent pushes to `ui-dev` can deploy through the connected Git project. With the Vercel CLI linked to the project and environment variables configured, deploy from the repository root with `vercel --prod`.
+
+The Vercel dashboard uses read-only Spread requests to report connectivity and the active world. The dashboard response is edge-cached for 15 seconds; replay requests do not call Spread. Vercel's **Simulate a run** always replays the bundled historical result; live practice simulation remains available only in the local Node development server. Durable cloud simulation and output storage are not configured. Enable Vercel Deployment Protection if this dashboard should not be publicly accessible.
