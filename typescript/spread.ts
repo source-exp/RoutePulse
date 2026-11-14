@@ -76,8 +76,9 @@ class Bucket {
    * wait until the bucket holds them. A final world takes one token for each action. */
   take(actions: number): number {
     const cost = this.name === "final-actions" ? Math.max(1, actions) : 1
+    const maxBurst = this.name === "final-actions" || this.name === "final-reads" ? 50 : Infinity
     const now = performance.now()
-    const tokens = this.tokens + ((now - this.at) / 1000) * this.perSecond
+    const tokens = Math.min(maxBurst, this.tokens + ((now - this.at) / 1000) * this.perSecond)
     const delayMs = Math.max(0, ((cost - tokens) * 1000) / this.perSecond)
     this.tokens = tokens + (delayMs / 1000) * this.perSecond - cost
     this.at = now + delayMs
@@ -233,9 +234,10 @@ export class World {
   /** Events as they happen, over the WebSocket. With `after`, first every event
    * above that sequence number. Reconnects by itself and misses nothing. With
    * `idleMs`, yields null after that long without an event, so a loop can check the clock. */
-  async *stream(options: { after?: number; idleMs?: number } = {}): AsyncGenerator<DeskEvent | null> {
+  async *stream(options: { after?: number; idleMs?: number; signal?: AbortSignal } = {}): AsyncGenerator<DeskEvent | null> {
     let last = options.after
     for (let failures = 0; failures < 60; failures++) {
+      if (options.signal?.aborted) return
       // A WebSocket cannot report an HTTP error, so one read first checks the key and the world.
       try {
         await this.events(last ?? -1, 1)
@@ -251,13 +253,20 @@ export class World {
       const socket = new WebSocket(url, { headers: { authorization: `Bearer ${this.client.key}` } } as unknown as string[])
       socket.onmessage = (message) => (queue.push(JSON.parse(String(message.data))), wake())
       socket.onclose = (close) => (queue.push({ closed: close.code }), wake())
+      const onAbort = () => {
+        socket.close()
+        wake()
+      }
+      options.signal?.addEventListener("abort", onAbort, { once: true })
       try {
         while (true) {
+          if (options.signal?.aborted) return
           if (queue.length === 0) {
             await new Promise<void>((done) => {
               wake = done
               if (options.idleMs !== undefined) setTimeout(done, options.idleMs)
             })
+            if (options.signal?.aborted) return
             if (queue.length === 0) yield null
             continue
           }

@@ -658,6 +658,7 @@ export class DirectOfferTracker {
   readonly openOffersByGig = new Map<string, Map<string, number>>()
   readonly globalOpenOfferDrivers = new Set<string>()
   readonly attemptedGigDrivers = new Set<string>()
+  readonly refusedPairUntil = new Map<string, number>()
   readonly declinedMaxFee = new Map<string, number>()
 
   recordView(driverId: string, at: number, gigId?: string): void {
@@ -722,13 +723,14 @@ export class DirectOfferTracker {
     this.openOffersByGig.get(gigId)?.delete(driverId)
     const stillOpenElsewhere = [...this.openOffersByGig.values()].some((m) => m.has(driverId))
     if (!stillOpenElsewhere) this.globalOpenOfferDrivers.delete(driverId)
-    if (/per day|three|3|limit/i.test(reason) && /driver/i.test(reason)) {
+    if (/per day|three|3\s*offer|daily|limit/i.test(reason) && !/gig/i.test(reason)) {
       this.offersSentByDay.set(dayKey, 3)
     } else {
       const cur = this.offersSentByDay.get(dayKey) ?? 0
       if (cur > 0) this.offersSentByDay.set(dayKey, cur - 1)
     }
-    // Keep attemptedGigDrivers blocked so a refused (gigId, driverId) pair can NEVER spin-loop!
+    // Block (gigId, driverId) for 25m even on urgent gigs so refused offers can NEVER spin-loop!
+    this.refusedPairUntil.set(`${gigId}:${driverId}`, now + 25)
     this.attemptedGigDrivers.add(`${gigId}:${driverId}`)
   }
 
@@ -801,10 +803,13 @@ export class DirectOfferTracker {
       arr.push(c)
     }
 
+    const destPool30 = supply.pool30(gig.deliveryPlaceId, false, false)
+    const sameCluster = map.isSameCluster30(gig.pickupPlaceId, gig.deliveryPlaceId)
     const scored: Array<{ driver: DriverProfile; score: number; feeCents: number }> = []
 
     for (const d of supply.drivers) {
       if (this.globalOpenOfferDrivers.has(d.id)) continue
+      if ((this.refusedPairUntil.get(`${gig.gigId}:${d.id}`) ?? -Infinity) > now) continue
       if (!isUrgent && this.attemptedGigDrivers.has(`${gig.gigId}:${d.id}`)) continue
       const usedToday = this.offersToday(d.id, now)
       if (usedToday >= 3) continue
@@ -853,62 +858,77 @@ export class DirectOfferTracker {
       }
 
       const vInfo = this.gigViewers.get(gig.gigId)?.get(d.id)
-      const isRepeatViewer = Boolean(vInfo && vInfo.count >= 2)
-      const isRecentGigViewer = Boolean(vInfo && now - vInfo.lastAt <= 95)
+      const isRepeatViewer = Boolean(vInfo && vInfo.count >= 2 && now - vInfo.lastAt <= 60)
+      const isSingleViewer = Boolean(vInfo && vInfo.count === 1 && now - vInfo.lastAt <= 90)
 
-      // Only send offers to genuinely active drivers (eliminates 1,800+ expired offers/wk on logged-off drivers!)
-      const maxInactiveMins = vInfo ? 240 : isUrgent || isScarce ? 180 : 90
+      // Tight activity horizon: eliminates 70%+ of unread expired offers
+      const maxInactiveMins = vInfo ? 150 : isUrgent || isScarce ? 140 : 65
       if (!workedToday && !chained && minsSinceAct > maxInactiveMins) continue
 
       const distP = map.distKm(d.homePlaceId, gig.pickupPlaceId)
       const distD = map.distKm(d.homePlaceId, gig.deliveryPlaceId)
-      if (!chained && !isRepeatViewer && distP > 65 && distD > 30) continue
+      const positionedRepeatViewer = isRepeatViewer && slackMin >= 45
+      if (!chained && !positionedRepeatViewer && distP > 65 && distD > 30) continue
 
-      // Ensure non-chained home-origin drivers can actually reach pickup before effectiveLastPickupAt!
-      const transitMin = chained || isRepeatViewer ? 0 : Math.ceil(map.roadMinutes(d.homePlaceId, gig.pickupPlaceId) * 1.25)
-      if (!chained && !isRepeatViewer && now + transitMin + 15 > gig.effectiveLastPickupAt) continue
+      // Do not waste non-urgent offers on cold local drivers who already got the 30km push notification!
+      if (!isUrgent && !isScarce && !chained && !vInfo && distD > 30) continue
+      if (!isUrgent && !isScarce && !chained && !vInfo && distP <= 30 && distD <= 30) continue
+
+      const transitMin =
+        chained || positionedRepeatViewer ? 0 : Math.ceil(map.roadMinutes(d.homePlaceId, gig.pickupPlaceId) * 1.22)
+      if (!chained && !positionedRepeatViewer && now + transitMin + 15 > gig.effectiveLastPickupAt) continue
 
       let matchScore = -Infinity
-      if (chained && distD <= 30) matchScore = 112
-      else if (chained) matchScore = distP > 30 ? 96 : 80
-      else if (distD === 0 && distP > 30) matchScore = 84 - transitMin * 0.05
-      else if (distD <= 30 && distP > 30) matchScore = 76 - transitMin * 0.05
-      else if (distP > 30 && distP <= 65) matchScore = isScarce || isUrgent ? 72 : 48
-      else if (distP <= 30 && distD <= 30) matchScore = 54
-      else if (distP <= 30) matchScore = isUrgent || isScarce ? 64 : 40
-      else if (isRepeatViewer) matchScore = 58
+      if (chained && distD <= 30) matchScore = 118
+      else if (chained) matchScore = distP > 30 ? 98 : 84
+      else if (distD === 0 && distP > 30) matchScore = 90 - transitMin * 0.05
+      else if (distD <= 30 && distP > 30) matchScore = 82 - transitMin * 0.05
+      else if (distP > 30 && distP <= 65) matchScore = isScarce || isUrgent ? 74 : 52
+      else if (distP <= 30 && distD <= 30) matchScore = 58
+      else if (distP <= 30) matchScore = isUrgent || isScarce ? 66 : 46
+      else if (positionedRepeatViewer) matchScore = 62
 
       if (!Number.isFinite(matchScore)) continue
 
-      const viewerBonus = isRepeatViewer ? 52 : isRecentGigViewer ? 32 : 0
+      // Single viewer + home_return is the #1 empirical holdout converter (20.0% booker rate!)
+      const viewerBonus =
+        isRepeatViewer ? 54 :
+        isSingleViewer && distD <= 30 && distP > 30 ? 46 :
+        isSingleViewer ? 30 : 0
+
       const activityBonus =
         minsSinceAct <= 15 ? 30 :
-        workedToday ? 22 :
-        minsSinceAct <= 60 ? 18 :
-        10
+        minsSinceAct <= 45 ? 20 :
+        workedToday ? 16 : 8
 
       const dropPenalty = Math.min(26, d.drops * 3.8)
-      const budgetPenalty = usedToday * 10
+      const budgetPenalty = usedToday * 12
       const expSavePenalty = !gig.audience.experienced && isExp ? 8 : 0
       const totalScore = matchScore + viewerBonus + activityBonus - dropPenalty - budgetPenalty - expSavePenalty
 
-      if (totalScore < (isUrgent || isScarce ? 50 : 72)) continue
+      if (totalScore < (isUrgent || isScarce ? 52 : 78)) continue
 
       let feeCents: number
       if (gig.orderIds.length > 1) {
-        // Multi-order bundle: NEVER pay 0.95x-1.03x * refSum on a 0.56x-0.58x bundle!
         const maxBundleCap = Math.round(gig.refFeeCents * (gig.orderIds.length >= 3 ? 0.68 : 0.75))
-        const targetBundleOffer = Math.round(gig.currentAppFeeCents * (chained ? 0.98 : 1.02 + gig.offerWave * 0.04))
-        feeCents = Math.min(maxBundleCap, Math.max(gig.currentAppFeeCents, targetBundleOffer))
+        const targetBundleOffer = Math.round(
+          gig.currentAppFeeCents * (chained ? 0.96 : vInfo ? 1.05 : 1.02 + gig.offerWave * 0.04),
+        )
+        feeCents = chained
+          ? Math.min(maxBundleCap, Math.max(Math.round(gig.currentAppFeeCents * 0.94), targetBundleOffer))
+          : Math.max(gig.currentAppFeeCents, Math.min(maxBundleCap, targetBundleOffer))
       } else {
         let mult =
           chained && distD <= 30 ? 0.88 :
-          chained ? 0.93 :
-          distD <= 30 && distP > 30 ? (isScarce ? 0.98 : 0.93) :
-          distP <= 30 && distD <= 30 ? 0.95 :
+          chained ? 0.94 :
+          distD <= 30 && distP > 30 ? (isScarce || vInfo ? 1.00 : 0.97) :
+          distP <= 30 && distD <= 30 ? 0.96 :
           distP <= 30 ? 1.00 :
-          isScarce ? 1.08 : 1.02
+          isScarce ? 1.08 : 1.03
 
+        if (gig.driveMinutes > 195) mult += 0.06
+        if (gig.driveMinutes > 290) mult += 0.05
+        if (destPool30 <= 12 && !sameCluster) mult += 0.06
         if (gig.hasPrivateStop) mult += 0.09
         if (gig.audience.experienced) mult += 0.14
         if (isEveningOrSat) mult += 0.05
@@ -924,14 +944,18 @@ export class DirectOfferTracker {
         }
 
         const rawFee = Math.round(gig.refFeeCents * Math.min(2.65, mult))
-        feeCents =
-          isUrgent && slackMin <= 190
-            ? Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
-            : isRepeatViewer && !isUrgent
-              ? Math.max(gig.currentAppFeeCents, Math.min(rawFee, Math.round(gig.currentAppFeeCents * 1.06)))
-              : rawFee
-        if ((distP <= 30 || vInfo) && feeCents < gig.currentAppFeeCents) {
-          feeCents = gig.currentAppFeeCents
+        if (isUrgent && slackMin <= 190) {
+          feeCents = Math.max(rawFee, Math.round(gig.currentAppFeeCents * 1.04))
+        } else if (isRepeatViewer) {
+          const sweet = Math.round(gig.currentAppFeeCents * 1.07)
+          feeCents = Math.max(sweet, Math.min(rawFee, Math.round(gig.refFeeCents * 1.20)))
+        } else if (isSingleViewer) {
+          const sweet = Math.round(gig.currentAppFeeCents * 1.04)
+          feeCents = Math.max(sweet, rawFee)
+        } else if (chained) {
+          feeCents = Math.max(rawFee, Math.round(gig.currentAppFeeCents * 0.92))
+        } else {
+          feeCents = Math.max(rawFee, gig.currentAppFeeCents)
         }
       }
 

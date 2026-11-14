@@ -28,8 +28,8 @@ import {
   visitAt,
 } from "./planner.ts"
 import type { BuiltOrderStops, RetryState } from "./planner.ts"
-import { PricingEngine, RosterSupplyModel } from "./market.ts"
-import type { RecordedQuoteMeta } from "./market.ts"
+import { PricingEngine, RosterSupplyModel, unroundedListPriceCents } from "./market.ts"
+import type { BatchQuoteContext, RecordedQuoteMeta } from "./market.ts"
 import {
   buildSingleGigSchedule,
   DirectOfferTracker,
@@ -126,6 +126,9 @@ class Desk {
   readonly requests = new Map<string, PriceRequest>()
   readonly notesByOrder = new Map<string, ParsedLegNote[]>()
   readonly quoteMetaByReq = new Map<string, RecordedQuoteMeta>()
+  readonly pendingPriceRequests = new Map<string, PriceRequest>()
+  readonly unresolvedQuotes = new Map<string, RecordedQuoteMeta>()
+  readonly batches = new Map<string, { batchId: string; seenIds: Set<string>; wonIds: Set<string>; lostIds: Set<string> }>()
 
   readonly orders = new Map<string, Order>()
   readonly orderWonAt = new Map<string, number>()
@@ -348,14 +351,54 @@ class Desk {
     return count
   }
 
+  private pruneUnresolvedQuotes(): void {
+    for (const [reqId, meta] of this.unresolvedQuotes.entries()) {
+      if (meta.request.respondBy <= this.now || this.orders.has(reqId)) {
+        this.unresolvedQuotes.delete(reqId)
+      }
+    }
+  }
+
+  private totalUnresolvedExpectedWins(): number {
+    let sum = 0
+    for (const meta of this.unresolvedQuotes.values()) {
+      if (meta.request.respondBy > this.now && !this.orders.has(meta.request.id)) {
+        sum += meta.expectedWinProb
+      }
+    }
+    return sum
+  }
+
+  private recordBatchArrival(request: PriceRequest): void {
+    if (!request.batchId) return
+    let st = this.batches.get(request.batchId)
+    if (!st) {
+      st = { batchId: request.batchId, seenIds: new Set(), wonIds: new Set(), lostIds: new Set() }
+      this.batches.set(request.batchId, st)
+    }
+    st.seenIds.add(request.id)
+  }
+
   private countActiveOrdersOnDeadlineDay(deadlineDay: number): number {
     let count = 0
     for (const o of this.orders.values()) {
-      if (undeliveredLegs(o).length === 0) continue
+      if (undeliveredLegs(o).length === 0) {
+        const lastDeliv = o.deliveredAt[o.deliveredAt.length - 1]
+        if (lastDeliv !== null && Math.floor(lastDeliv / DAY) === deadlineDay && Math.floor(this.now / DAY) === deadlineDay) {
+          count += 0.55
+        }
+        continue
+      }
       const notes = this.getNotes(o.id)
       const noteDl = notes[notes.length - 1]?.noteDeadline ?? notes[0]?.noteDeadline ?? null
       const effDl = noteDl !== null ? Math.min(o.deadline, noteDl) : o.deadline
       if (Math.floor(effDl / DAY) === deadlineDay) count++
+    }
+    for (const meta of this.unresolvedQuotes.values()) {
+      if (meta.request.respondBy <= this.now || this.orders.has(meta.request.id)) continue
+      for (const d of meta.expectedWinsByDeadlineDay) {
+        if (d.deadlineDay === deadlineDay) count += d.expectedWins
+      }
     }
     return count
   }
@@ -374,6 +417,63 @@ class Desk {
     return count
   }
 
+  private countPendingPickupsInCluster30(placeId: string): number {
+    const cluster = new Set(this.map.within30km.get(placeId) ?? [placeId])
+    let count = 0
+    for (const act of this.outbox) {
+      if (act.type !== "post" || !act.stops[0]) continue
+      const p0 = act.stops[0]
+      const o = this.orders.get(p0.orderId)
+      const pId = o?.legs[p0.leg]?.pickup.placeId
+      if (pId && cluster.has(pId)) count++
+    }
+    for (const bufferedId of this.pairingBufferUntil.keys()) {
+      const o = this.orders.get(bufferedId)
+      if (!o) continue
+      const undel = undeliveredLegs(o)
+      if (undel.length === 0) continue
+      const leg0 = undel[0]!
+      if (this.legGigs.get(o.id)?.has(leg0) || this.hasPendingPostInOutbox(o.id, leg0)) continue
+      const pId = o.legs[leg0]?.pickup.placeId
+      if (pId && cluster.has(pId)) count++
+    }
+    for (const meta of this.unresolvedQuotes.values()) {
+      if (meta.request.respondBy <= this.now || this.orders.has(meta.request.id)) continue
+      const pId = meta.request.legs[0]?.pickup.placeId
+      if (pId && cluster.has(pId)) count += meta.expectedWinProb
+    }
+    return count
+  }
+
+  private countOverdueUndeliveredOrders(): number {
+    let count = 0
+    for (const o of this.orders.values()) {
+      if (undeliveredLegs(o).length === 0) continue
+      const notes = this.getNotes(o.id)
+      const noteDl = notes[notes.length - 1]?.noteDeadline ?? notes[0]?.noteDeadline ?? null
+      const effDl = noteDl !== null ? Math.min(o.deadline, noteDl) : o.deadline
+      if (this.now > effDl) count++
+    }
+    return count
+  }
+
+  private countInFlightDealerOrders(dealerId: string): number {
+    let count = 0
+    for (const o of this.orders.values()) {
+      if (o.dealerId !== dealerId || undeliveredLegs(o).length === 0) continue
+      const notes = this.getNotes(o.id)
+      const noteDl = notes[notes.length - 1]?.noteDeadline ?? notes[0]?.noteDeadline ?? null
+      const effDl = noteDl !== null ? Math.min(o.deadline, noteDl) : o.deadline
+      if (this.now <= effDl) count += 0.96
+    }
+    for (const meta of this.unresolvedQuotes.values()) {
+      if (meta.request.dealerId !== dealerId) continue
+      if (meta.request.respondBy <= this.now || this.orders.has(meta.request.id)) continue
+      count += meta.expectedWinProb
+    }
+    return count
+  }
+
   private hasArrivingDriverSynergy(pickupId: string, deliveryId: string, earliestMin: number, latestMin: number): boolean {
     const comms = this.activeCommitments()
     for (const c of comms) {
@@ -386,7 +486,14 @@ class Desk {
     return false
   }
 
-  private hasOpenRoundTripPartner(pickupId: string, deliveryId: string): boolean {
+  private computeRoundTripPartnerCredit(
+    currentReqId: string,
+    pickupId: string,
+    deliveryId: string,
+    earliestPickupAt: number,
+    effectiveLastPickupAt: number,
+    effectiveDeadline: number,
+  ): number {
     for (const bufferedId of this.pairingBufferUntil.keys()) {
       const o = this.orders.get(bufferedId)
       if (!o || o.legs.length !== 1) continue
@@ -396,7 +503,7 @@ class Desk {
         this.map.roadMinutes(l.delivery.placeId, pickupId) <= 50 &&
         this.map.roadMinutes(deliveryId, l.pickup.placeId) <= 120
       ) {
-        return true
+        return 1.0
       }
     }
     for (const g of this.gigs.values()) {
@@ -410,10 +517,52 @@ class Desk {
         this.map.roadMinutes(l.delivery.placeId, pickupId) <= 50 &&
         this.map.roadMinutes(deliveryId, l.pickup.placeId) <= 120
       ) {
-        return true
+        return 1.0
       }
     }
-    return false
+    if (effectiveLastPickupAt - this.now < 300) return 0
+    const myReadyDay = Math.floor(earliestPickupAt / DAY)
+    const myDlDay = Math.floor(effectiveDeadline / DAY)
+    const r1 = this.map.roadMinutes(pickupId, deliveryId)
+    let missOpposing = 1.0
+    let missLocal = 1.0
+    const tod = this.now % DAY
+    const inPw = tod >= 8 * HOUR && tod <= 18 * HOUR && this.level === 8 && this.pricing.estimator.priceWarToday
+
+    const considerCandidate = (cand: PriceRequest, candWinProb: number): void => {
+      if (cand.id === currentReqId || candWinProb < 0.05 || cand.legs.length !== 1) return
+      const l2 = cand.legs[0]!
+      if (l2.car.premium || l2.pickup.privateAddress || l2.delivery.privateAddress) return
+      const n2 = this.notesByOrder.get(cand.id)?.[0]
+      const P2 = l2.pickup.placeId
+      const D2 = l2.delivery.placeId
+      const maxCandDl = cand.options[cand.options.length - 1]?.deadline ?? 0
+      if (n2?.summerTyres && this.snow.overlaps(P2, D2, this.now, maxCandDl)) return
+      const candReadyDay = Math.floor(Math.max(l2.pickup.window.from, n2?.readyAt ?? 0) / DAY)
+      const candDlDay = Math.floor(Math.min(maxCandDl, n2?.noteDeadline ?? Infinity) / DAY)
+      if (candReadyDay > myDlDay || myReadyDay > candDlDay) return
+      const dh12 = this.map.roadMinutes(deliveryId, P2)
+      const dh21 = this.map.roadMinutes(D2, pickupId)
+      if (dh12 > 50 || dh21 > 50 || r1 + dh12 + this.map.roadMinutes(P2, D2) > 540) return
+      if (!this.map.isSameCluster30(pickupId, P2)) {
+        missOpposing *= 1 - candWinProb
+      } else if (dh12 <= 40 && dh21 <= 40) {
+        missLocal *= 1 - 0.5 * candWinProb
+      }
+    }
+
+    for (const meta of this.unresolvedQuotes.values()) {
+      if (meta.request.respondBy <= this.now || this.orders.has(meta.request.id)) continue
+      considerCandidate(meta.request, meta.expectedWinProb)
+    }
+    const unquotedPriorProb = inPw ? 0.12 : 0.38
+    for (const pendingReq of this.pendingPriceRequests.values()) {
+      if (pendingReq.respondBy <= this.now || this.unresolvedQuotes.has(pendingReq.id)) continue
+      considerCandidate(pendingReq, unquotedPriorProb)
+    }
+    const pOpposing = 1 - missOpposing
+    const pLocal = 1 - missLocal
+    return Math.min(0.85, 0.90 * pOpposing + 0.42 * (1 - pOpposing) * pLocal)
   }
 
   private finalizePendingRevenue(upToMinute: number): void {
@@ -433,13 +582,20 @@ class Desk {
   private markLateOrPenalized(orderId: string): void {
     if (this.lateOrPenalizedOrders.has(orderId)) return
     this.lateOrPenalizedOrders.add(orderId)
+    const pendingRev = this.pendingRevenueOrders.get(orderId)
+    if (pendingRev) {
+      this.pendingRevenueOrders.delete(orderId)
+      this.deliveredOrdersTotal++
+      this.pricing.estimator.onOrderDelivered(pendingRev.dealerId, false)
+      return
+    }
     const alreadyOnTimeDealer = this.finalizedOnTimeOrders.get(orderId)
     if (alreadyOnTimeDealer) {
       this.finalizedOnTimeOrders.delete(orderId)
       if (this.deliveredOnTimeTotal > 0) this.deliveredOnTimeTotal--
       const d = this.pricing.estimator.getDealer(alreadyOnTimeDealer)
       if (this.level === 8) d.trust = Math.floor(Math.max(0, d.trust - 1) / 2)
-      d.lateCount++
+      d.lateCount = Math.min(6, d.lateCount + 1.125)
     }
   }
 
@@ -447,6 +603,8 @@ class Desk {
     this.now = snapshot.now
     this.endsAt = snapshot.endsAt
     this.startMinute = history[0]?.at ?? snapshot.now
+
+    const openReqIds = new Set(snapshot.openRequests.map((r) => r.id))
 
     for (const ev of history) {
       this.now = Math.max(this.now, ev.at)
@@ -457,20 +615,23 @@ class Desk {
         this.requests.set(ev.request.id, ev.request)
         const notes = parseDealerNote(ev.request)
         this.notesByOrder.set(ev.request.id, notes)
-        // Reconstruct approximate quote meta so CompetitorMarketEstimator recovers worldLogMean, PW & Outages on restart!
-        const meta = this.pricing.quoteRequest(ev.request, notes, {
-          now: ev.at,
-          wonOrdersTotal: this.wonOrdersTotal,
-          deliveredOrdersTotal: this.deliveredOrdersTotal,
-          deliveredOnTimeTotal: this.deliveredOnTimeTotal,
-          unbookedOrdersCount: 10,
-          openPickupsInCluster30: () => 0,
-          activeOrdersOnDeadlineDay: () => 35,
-          hasArrivingDriverSynergy: () => false,
-          hasOpenRoundTripPartner: () => false,
-          fluActiveToday: this.fluActiveToday,
-        })
-        if (meta) this.quoteMetaByReq.set(ev.request.id, meta)
+        this.recordBatchArrival(ev.request)
+        if (!openReqIds.has(ev.request.id)) {
+          const meta = this.pricing.quoteRequest(ev.request, notes, {
+            now: ev.at,
+            startMinute: this.startMinute,
+            wonOrdersTotal: this.wonOrdersTotal,
+            deliveredOrdersTotal: this.deliveredOrdersTotal,
+            deliveredOnTimeTotal: this.deliveredOnTimeTotal,
+            unbookedOrdersCount: 10,
+            openPickupsInCluster30: () => 0,
+            activeOrdersOnDeadlineDay: () => 35,
+            hasArrivingDriverSynergy: () => false,
+            roundTripPartnerCredit: () => 0,
+            fluActiveToday: this.fluActiveToday,
+          })
+          if (meta) this.quoteMetaByReq.set(ev.request.id, meta)
+        }
       } else if (ev.kind === "forecast") {
         this.snow.addForecast(ev.from, ev.to, ev.placeIds)
       } else if (ev.kind === "deadline_close") {
@@ -478,13 +639,19 @@ class Desk {
       } else if (ev.kind === "order_won") {
         this.wonOrdersTotal++
         this.orderWonAt.set(ev.order.id, ev.at)
+        const req = this.requests.get(ev.order.id)
+        if (req?.batchId) this.batches.get(req.batchId)?.wonIds.add(ev.order.id)
         const meta = this.quoteMetaByReq.get(ev.order.id)
         if (meta) this.pricing.estimator.onQuoteResolved(meta, ev.order.option)
       } else if (ev.kind === "order_lost") {
+        const req = this.requests.get(ev.requestId)
+        if (req?.batchId) this.batches.get(req.batchId)?.lostIds.add(ev.requestId)
         const meta = this.quoteMetaByReq.get(ev.requestId)
         if (meta) this.pricing.estimator.onQuoteResolved(meta, null)
       } else if (ev.kind === "order_cancelled") {
         if (this.wonOrdersTotal > 0) this.wonOrdersTotal--
+        const req = this.requests.get(ev.orderId)
+        if (req?.batchId) this.batches.get(req.batchId)?.wonIds.delete(ev.orderId)
       } else if (ev.kind === "order_changed") {
         const notes = this.getNotes(ev.order.id)
         for (let l = 0; l < ev.order.legs.length; l++) {
@@ -594,6 +761,7 @@ class Desk {
         this.handlePriceRequest(req)
       }
     }
+    this.flushPendingPriceRequests()
   }
 
   handle(event: DeskEvent): void {
@@ -677,33 +845,141 @@ class Desk {
 
   private handlePriceRequest(request: PriceRequest): void {
     this.requests.set(request.id, request)
-    const notes = parseDealerNote(request)
-    this.notesByOrder.set(request.id, notes)
+    if (!this.notesByOrder.has(request.id)) {
+      this.notesByOrder.set(request.id, parseDealerNote(request))
+    }
+    this.recordBatchArrival(request)
     if (request.respondBy <= this.now) {
       this.pricing.estimator.getDealer(request.dealerId).unquotedCount++
       return
     }
+    if (this.quoteMetaByReq.has(request.id) || this.orders.has(request.id)) return
+    this.pendingPriceRequests.set(request.id, request)
+  }
 
-    const meta = this.pricing.quoteRequest(request, notes, {
-      now: this.now,
-      wonOrdersTotal: this.wonOrdersTotal,
-      deliveredOrdersTotal: this.deliveredOrdersTotal,
-      deliveredOnTimeTotal: this.deliveredOnTimeTotal,
-      unbookedOrdersCount: this.countUnbookedOrders(),
-      openPickupsInCluster30: (p) => this.countOpenPickupsInCluster30(p),
-      activeOrdersOnDeadlineDay: (dlDay) => this.countActiveOrdersOnDeadlineDay(dlDay),
-      hasArrivingDriverSynergy: (p, d, eMin, lMin) => this.hasArrivingDriverSynergy(p, d, eMin, lMin),
-      hasOpenRoundTripPartner: (p, d) => this.hasOpenRoundTripPartner(p, d),
-      fluActiveToday: this.fluActiveToday,
+  private scorePendingRequestPriority(req: PriceRequest, pendingList: readonly PriceRequest[]): number {
+    const leg0 = req.legs[0]!
+    const lastLeg = req.legs[req.legs.length - 1]!
+    const pickupId = leg0.pickup.placeId
+    const deliveryId = lastLeg.delivery.placeId
+    const legKms = req.legs.map((l) => this.map.roadKm(l.pickup.placeId, l.delivery.placeId))
+    const refOpt = req.options.some((o) => o.kind === "next_day") ? "next_day" : req.options[0]!.kind
+    const ulp = unroundedListPriceCents(legKms, refOpt)
+    const dealer = this.pricing.estimator.getDealer(req.dealerId)
+    const trustMult = this.level === 8 ? 1 + 0.01 * dealer.trust : 1.0
+    const worldMult = this.level >= 8 ? Math.exp(this.pricing.estimator.worldLogMean) : 1.22
+    const grossHeadroomCents = ulp * worldMult * trustMult - req.referenceFeeCents * 0.92
+    const destPool30 = this.supply.pool30(deliveryId, false, false)
+    const destBonusCents = destPool30 >= 80 ? 950 : destPool30 >= 25 ? 300 : -650
+
+    let hasMutualOrOpenRT = false
+    if (req.legs.length === 1 && !leg0.car.premium && !leg0.pickup.privateAddress && !leg0.delivery.privateAddress) {
+      const maxDl = req.options[req.options.length - 1]!.deadline
+      if (this.computeRoundTripPartnerCredit(req.id, pickupId, deliveryId, leg0.pickup.window.from, maxDl, maxDl) >= 0.25) {
+        hasMutualOrOpenRT = true
+      } else {
+        hasMutualOrOpenRT = pendingList.some((other) => {
+          if (other.id === req.id || other.legs.length !== 1) return false
+          const ol = other.legs[0]!
+          if (ol.car.premium || ol.pickup.privateAddress || ol.delivery.privateAddress) return false
+          return (
+            !this.map.isSameCluster30(pickupId, ol.pickup.placeId) &&
+            this.map.roadMinutes(deliveryId, ol.pickup.placeId) <= 50 &&
+            this.map.roadMinutes(ol.delivery.placeId, pickupId) <= 50
+          )
+        })
+      }
+    }
+    const notes = this.getNotes(req.id)
+    const needsCharging = req.legs.some((l) => this.map.needsCharging(l.car, l.pickup.placeId, l.delivery.placeId))
+    const frictionPenaltyCents =
+      (req.legs.some((l) => l.car.premium) ? 700 : 0) +
+      (req.legs.some((l) => l.pickup.privateAddress || l.delivery.privateAddress) ? 800 : 0) +
+      (req.legs.length > 1 ? 600 : 0) +
+      (needsCharging ? 450 : 0) +
+      (notes[0]?.manualGearbox ? 250 : 0)
+
+    return grossHeadroomCents + destBonusCents + (hasMutualOrOpenRT ? 1100 : 0) - frictionPenaltyCents
+  }
+
+  flushPendingPriceRequests(): void {
+    this.pruneUnresolvedQuotes()
+    if (this.pendingPriceRequests.size === 0) return
+
+    const validList: PriceRequest[] = []
+    for (const req of this.pendingPriceRequests.values()) {
+      if (req.respondBy <= this.now) {
+        this.pendingPriceRequests.delete(req.id)
+        this.pricing.estimator.getDealer(req.dealerId).unquotedCount++
+        continue
+      }
+      validList.push(req)
+    }
+    if (validList.length === 0) return
+
+    const priorities = new Map<string, number>()
+    for (const req of validList) {
+      priorities.set(req.id, this.scorePendingRequestPriority(req, validList))
+    }
+    validList.sort((a, b) => {
+      const diff = (priorities.get(b.id) ?? 0) - (priorities.get(a.id) ?? 0)
+      if (Math.abs(diff) > 1e-6) return diff
+      if (a.arrivedAt !== b.arrivedAt) return a.arrivedAt - b.arrivedAt
+      return a.id.localeCompare(b.id)
     })
 
-    if (!meta) return
-    this.quoteMetaByReq.set(request.id, meta)
-    this.outbox.push({
-      type: "quote",
-      requestId: request.id,
-      prices: meta.prices,
-    })
+    for (const request of validList) {
+      this.pendingPriceRequests.delete(request.id)
+      const notes = this.getNotes(request.id)
+      const pendingExpWins = this.totalUnresolvedExpectedWins()
+
+      let batchInfo: BatchQuoteContext | undefined
+      if (request.batchId) {
+        const st = this.batches.get(request.batchId)
+        let batchUnres = 0
+        for (const u of this.unresolvedQuotes.values()) {
+          if (u.request.batchId === request.batchId && u.request.respondBy > this.now && !this.orders.has(u.request.id)) {
+            batchUnres += u.expectedWinProb
+          }
+        }
+        batchInfo = {
+          batchId: request.batchId,
+          seenCount: st?.seenIds.size ?? 1,
+          wonCount: st?.wonIds.size ?? 0,
+          unresolvedExpectedWins: batchUnres,
+        }
+      }
+
+      const meta = this.pricing.quoteRequest(request, notes, {
+        now: this.now,
+        startMinute: this.startMinute,
+        wonOrdersTotal: this.wonOrdersTotal + pendingExpWins,
+        deliveredOrdersTotal: this.deliveredOrdersTotal,
+        deliveredOnTimeTotal: this.deliveredOnTimeTotal,
+        overdueUndeliveredCount: this.countOverdueUndeliveredOrders(),
+        unbookedOrdersCount: this.countUnbookedOrders() + pendingExpWins,
+        openPickupsInCluster30: (p) => this.countOpenPickupsInCluster30(p),
+        pendingPickupsInCluster30: (p) => this.countPendingPickupsInCluster30(p),
+        activeOrdersOnDeadlineDay: (dlDay) => this.countActiveOrdersOnDeadlineDay(dlDay),
+        inFlightDealerOrders: (dId) => this.countInFlightDealerOrders(dId),
+        hasArrivingDriverSynergy: (p, d, eMin, lMin) => this.hasArrivingDriverSynergy(p, d, eMin, lMin),
+        roundTripPartnerCredit: (p, d, ePick, lPick, effDl) =>
+          this.computeRoundTripPartnerCredit(request.id, p, d, ePick, lPick, effDl),
+        batchInfo,
+        fluActiveToday: this.fluActiveToday,
+      })
+
+      if (!meta) continue
+      this.quoteMetaByReq.set(request.id, meta)
+      if (meta.expectedWinProb > 0) {
+        this.unresolvedQuotes.set(request.id, meta)
+      }
+      this.outbox.push({
+        type: "quote",
+        requestId: request.id,
+        prices: meta.prices,
+      })
+    }
   }
 
   private handleOrderWon(order: Order, at: number): void {
@@ -711,6 +987,10 @@ class Desk {
     this.orders.set(order.id, order)
     this.orderWonAt.set(order.id, at)
     this.wonOrdersTotal++
+    this.unresolvedQuotes.delete(order.id)
+    this.pendingPriceRequests.delete(order.id)
+    const req = this.requests.get(order.id)
+    if (req?.batchId) this.batches.get(req.batchId)?.wonIds.add(order.id)
 
     const meta = this.quoteMetaByReq.get(order.id)
     if (meta) {
@@ -721,6 +1001,10 @@ class Desk {
   }
 
   private handleOrderLost(requestId: string): void {
+    this.unresolvedQuotes.delete(requestId)
+    this.pendingPriceRequests.delete(requestId)
+    const req = this.requests.get(requestId)
+    if (req?.batchId) this.batches.get(req.batchId)?.lostIds.add(requestId)
     const meta = this.quoteMetaByReq.get(requestId)
     if (meta) {
       this.pricing.estimator.onQuoteResolved(meta, null)
@@ -812,6 +1096,8 @@ class Desk {
     this.legGigs.delete(orderId)
     this.urgent.delete(orderId)
     this.pairingBufferUntil.delete(orderId)
+    const cReq = this.requests.get(orderId)
+    if (cReq?.batchId) this.batches.get(cReq.batchId)?.wonIds.delete(orderId)
 
     const displaced = this.removeUnsentPostsForOrder(orderId)
     const toRedispatch = new Set<string>(displaced.map((s) => s.orderId))
@@ -1894,19 +2180,7 @@ class Desk {
     return actions
   }
 
-  async send(isFinal = false): Promise<void> {
-    if (this.outbox.length === 0) return
-    if (!isFinal) {
-      const actions = this.drainOutboxSorted()
-      if (actions.length > 0) {
-        const results = await this.world.act(actions)
-        this.readResults(actions, results)
-      }
-      return
-    }
-
-    // Live --final phased transmission:
-    // Phase 1: Urgent quote fast-lane in chunks <= 20 so bulk orders answer well inside the 4.5s respondBy budget!
+  async sendQuotesOnly(): Promise<void> {
     const quotes: Action[] = []
     for (let i = this.outbox.length - 1; i >= 0; i--) {
       if (this.outbox[i]!.type === "quote") {
@@ -1919,6 +2193,26 @@ class Desk {
       const res = await this.world.act(chunk)
       this.readResults(chunk, res)
     }
+  }
+
+  async send(isFinal = false): Promise<void> {
+    if (this.outbox.length === 0) return
+    if (!isFinal) {
+      const hasCancel = this.outbox.some((a) => a.type === "withdraw" || a.type === "release")
+      const hasPost = this.outbox.some((a) => a.type === "post")
+      if (!hasCancel || !hasPost) {
+        const actions = this.drainOutboxSorted()
+        if (actions.length > 0) {
+          const results = await this.world.act(actions)
+          this.readResults(actions, results)
+        }
+        return
+      }
+    }
+
+    // Phased transmission:
+    // Phase 1: Urgent quote fast-lane in chunks <= 20 so bulk orders answer well inside the 4.5s respondBy budget!
+    await this.sendQuotesOnly()
 
     // Phase 2: Withdraw & release BEFORE companion posts so a raced booking/start cancels duplicate posts!
     const cancels: Action[] = []
@@ -1948,6 +2242,7 @@ class Desk {
       if (!res) return
       if (action.type === "quote") {
         if (!res.ok) {
+          this.unresolvedQuotes.delete(action.requestId)
           const req = this.requests.get(action.requestId)
           if (req) this.pricing.estimator.getDealer(req.dealerId).unquotedCount++
         }
@@ -2004,17 +2299,27 @@ class Desk {
       } else if (action.type === "withdraw" || action.type === "release") {
         if (!res.ok) {
           const g = this.gigs.get(action.gigId)
-          if (g && /book|start|work/i.test(res.reason)) {
-            g.status = /start|work/i.test(res.reason) ? "working" : "booked"
-            this.linkGig(g)
-            // Cancel any pending replacement post in outbox that overlaps with g's orders!
+          if (g && !/withdrawn|expired|not open|not found|unknown|already released/i.test(res.reason)) {
+            g.status = /done|deliver|complete/i.test(res.reason)
+              ? "done"
+              : /start|work|mov|left/i.test(res.reason)
+                ? "working"
+                : "booked"
+            if (g.status !== "done") this.linkGig(g)
+            // Cancel any pending replacement post in outbox that overlaps with g's pickup (orderId:leg) pairs!
+            const coveredLegs = new Set(
+              g.stops.filter((s) => s.kind === "pickup").map((s) => `${s.orderId}:${s.leg}`),
+            )
             const coveredOrders = new Set(g.stops.map((s) => s.orderId))
             const orphanedPartners = new Set<string>()
             for (let k = this.outbox.length - 1; k >= 0; k--) {
               const cand = this.outbox[k]!
-              if (cand.type === "post" && cand.stops.some((s) => coveredOrders.has(s.orderId))) {
+              if (
+                cand.type === "post" &&
+                cand.stops.some((s) => s.kind === "pickup" && coveredLegs.has(`${s.orderId}:${s.leg}`))
+              ) {
                 for (const s of cand.stops) {
-                  if (!coveredOrders.has(s.orderId)) orphanedPartners.add(s.orderId)
+                  if (s.kind === "pickup" && !coveredOrders.has(s.orderId)) orphanedPartners.add(s.orderId)
                 }
                 this.outbox.splice(k, 1)
               }
@@ -2056,6 +2361,7 @@ async function playPractice(world: World, level: number): Promise<void> {
     desk.readResults(actions, step.results)
     desk.now = step.now
     for (const event of step.events) desk.handle(event)
+    desk.flushPendingPriceRequests()
     desk.tickTimers(false)
     if (Math.floor(desk.now / DAY) > day) {
       report(WEEKDAYS[day % 7]!, await world.score())
@@ -2086,6 +2392,7 @@ async function playFinal(world: World): Promise<void> {
     if (ev.kind === "order_won" && desk.orders.has(ev.order.id)) continue
     desk.handle(ev)
   }
+  desk.flushPendingPriceRequests()
   const startAfterSeq = (tail.at(-1) ?? history0.at(-1))?.seq ?? -1
   desk.tickTimers(true)
   await desk.send(true)
@@ -2098,10 +2405,11 @@ async function playFinal(world: World): Promise<void> {
   let streamDone = false
   let streamError: unknown = null
   let notifyPump = () => {}
+  const abortCtrl = new AbortController()
 
   void (async () => {
     try {
-      for await (const ev of world.stream({ after: startAfterSeq, idleMs: 600 })) {
+      for await (const ev of world.stream({ after: startAfterSeq, idleMs: 600, signal: abortCtrl.signal })) {
         pending.push(ev)
         notifyPump()
       }
@@ -2113,47 +2421,65 @@ async function playFinal(world: World): Promise<void> {
     }
   })()
 
-  while (!streamDone || pending.length > 0) {
-    if (streamError) throw streamError
-    if (pending.length === 0) {
-      await new Promise<void>((resolve) => {
-        notifyPump = resolve
-      })
-      if (pending.length === 0) continue
-    }
-    // 6ms micro-batch coalesce to gather simultaneous bulk-order requests & ledger pairs
-    await new Promise((resolve) => setTimeout(resolve, 6))
+  try {
+    while (!streamDone || pending.length > 0) {
+      if (streamError) throw streamError
+      if (pending.length === 0) {
+        await new Promise<void>((resolve) => {
+          notifyPump = resolve
+        })
+        if (pending.length === 0) continue
+      }
+      // 6ms micro-batch coalesce to gather simultaneous bulk-order requests & ledger pairs
+      await new Promise((resolve) => setTimeout(resolve, 6))
 
-    const day = Math.floor(desk.now / DAY)
-    const batch = pending.splice(0)
-    let sawNull = false
-    for (const item of batch) {
-      if (item === null) sawNull = true
-      else desk.handle(item)
-    }
-    if (sawNull && batch.every((x) => x === null)) {
-      const f = await world.client.final().catch(() => null)
-      if (f) desk.now = Math.max(desk.now, f.now)
-    }
+      const day = Math.floor(desk.now / DAY)
+      const batch = pending.splice(0)
+      let sawNull = false
+      for (const item of batch) {
+        if (item === null) sawNull = true
+        else desk.handle(item)
+      }
+      if (sawNull && batch.every((x) => x === null)) {
+        const f = await world.client.final().catch(() => null)
+        if (f) desk.now = Math.max(desk.now, f.now)
+      }
+      desk.flushPendingPriceRequests()
 
-    // Flush any urgent quotes immediately before running timer/offer passes!
-    if (desk.outbox.some((a) => a.type === "quote")) {
+      // Flush any urgent quotes immediately via sendQuotesOnly() before running timer/offer passes!
+      if (desk.outbox.some((a) => a.type === "quote")) {
+        await desk.sendQuotesOnly()
+      }
+      desk.tickTimers(true)
       await desk.send(true)
-    }
-    desk.tickTimers(true)
-    await desk.send(true)
 
-    if (performance.now() - lastRosterFetchMs > 45_000) {
-      lastRosterFetchMs = performance.now()
-      const freshRoster = await world.roster().catch(() => null)
-      if (freshRoster) desk.supply.updateRoster(freshRoster)
-    }
+      if (performance.now() - lastRosterFetchMs > 45_000) {
+        lastRosterFetchMs = performance.now()
+        void world
+          .roster()
+          .then((fresh) => {
+            if (fresh) desk.supply.updateRoster(fresh)
+          })
+          .catch(() => null)
+      }
 
-    if (Math.floor(desk.now / DAY) > day) {
-      const sc = await world.score().catch(() => null)
-      if (sc) report(WEEKDAYS[day % 7]!, sc)
+      if (Math.floor(desk.now / DAY) > day) {
+        void world
+          .score()
+          .then((sc) => {
+            if (sc) report(WEEKDAYS[day % 7]!, sc)
+          })
+          .catch(() => null)
+      }
+      if (desk.now >= snapshot.endsAt) {
+        await new Promise((resolve) => setTimeout(resolve, 15))
+        if (pending.length > 0) continue
+        desk.finalizePendingRevenue(snapshot.endsAt)
+        return
+      }
     }
-    if (desk.now >= snapshot.endsAt) return
+  } finally {
+    abortCtrl.abort()
   }
 }
 
