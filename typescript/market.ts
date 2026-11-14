@@ -269,7 +269,12 @@ export class CompetitorMarketEstimator {
       )
     }
     if (this.priceWarToday) this.priceWarUsedThisWeek = true
-    if (this.outageCenterToday) this.outageUsedThisWeek = true
+    if (this.outageCenterToday) {
+      const endSt = this.regionOutStats.get(this.outageCenterToday)
+      if (endSt && (endSt.llr >= 1.5 || endSt.sumResIn / Math.max(1, endSt.nIn) >= 0.14)) {
+        this.outageUsedThisWeek = true
+      }
+    }
 
     this.currentDay = day
     this.dayLogOffset = 0
@@ -450,7 +455,14 @@ export class CompetitorMarketEstimator {
             bestCenter = center
           }
         }
-        if (bestCenter) this.outageCenterToday = bestCenter
+        if (bestCenter) {
+          this.outageCenterToday = bestCenter
+        } else if (this.outageCenterToday) {
+          const curSt = this.regionOutStats.get(this.outageCenterToday)
+          if (curSt && curSt.nIn >= 22 && curSt.llr <= 0.25 && curSt.sumResIn / curSt.nIn < 0.10) {
+            this.outageCenterToday = null
+          }
+        }
       }
     }
 

@@ -482,7 +482,7 @@ class Desk {
         urgentEscalated: gig.stops.some((s) => this.urgent.has(s.orderId)),
         urgentEscalatedAt: gig.stops.some((s) => this.urgent.has(s.orderId)) ? snapshot.now : null,
         pastDeadlineEscalated: false,
-        zombieCleared: gig.postedAt > snapshot.now,
+        zombieCleared: gig.stops[0] ? gig.postedAt > (this.orders.get(gig.stops[0].orderId)?.lastPickupAt ?? Infinity) : false,
         offerWave: 0,
         nextOfferCheckAt: snapshot.now + 30,
       }
@@ -1659,12 +1659,18 @@ class Desk {
 }
 
 async function playPractice(world: World, level: number): Promise<void> {
-  const [{ now, endsAt }, rawMap, roster] = await Promise.all([
+  const [snapshot, rawMap, roster] = await Promise.all([
     world.snapshot(),
     world.client.map(),
     world.roster(),
   ])
+  const { now, endsAt } = snapshot
   const desk = new Desk(world, level, now, endsAt, rawMap, roster)
+  if (now > 0) {
+    const history = await world.events()
+    await desk.rejoin(snapshot, history)
+    desk.tickTimers()
+  }
 
   while (desk.now < endsAt) {
     const day = Math.floor(desk.now / DAY)
@@ -1797,19 +1803,38 @@ async function main(): Promise<void> {
         await new Promise((done) => setTimeout(done, 3000))
       }
     }
-  } else {
-    const run = await client.create(level as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, { seed: args.seed, board: args.board })
-    world = run
-    const name = `${args.board ? "Ranking run" : "Practice world"} ${run.id}`
-    const afterStop = (deleted: boolean) =>
-      args.board
-        ? `${name} plays to its end without your system, and counts.`
-        : deleted
-          ? `${name} is deleted.`
-          : `${name} is not deleted: it holds one of your eight practice slots.`
-    console.log(
-      `${name}, level ${level}. ${args.board ? "Ctrl-C or an error stops your system: the run then plays to its end without it, and counts." : "Ctrl-C or an error stops the run and deletes the world."}`,
+  } else if (args.board) {
+    process.once("SIGINT", () =>
+      exit("Stopped. The ranking run stays paused on the server; re-run with --board to resume and finish it."),
     )
+    const existingWorlds = await client.worlds()
+    const unfinishedBoard = existingWorlds.find((w) => w.boardRun !== null && w.level === level && !w.ended)
+    const run = unfinishedBoard
+      ? client.world(unfinishedBoard.worldId)
+      : await client.create(level as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, { board: true })
+    world = run
+    console.log(
+      `Ranking run ${run.id}${unfinishedBoard ? ` (resumed run ${unfinishedBoard.boardRun})` : ""}, level ${level}.`,
+    )
+    while (true) {
+      try {
+        await playPractice(run, level)
+        break
+      } catch (error) {
+        if (error instanceof SpreadError && (error.status === 401 || error.status === 400)) throw error
+        console.error(`spread: ${(error as Error).message}. Rebuilding ranking desk and continuing in 3 seconds.`)
+        await new Promise((done) => setTimeout(done, 3000))
+      }
+    }
+  } else {
+    const run = await client.create(level as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, { seed: args.seed, board: false })
+    world = run
+    const name = `Practice world ${run.id}`
+    const afterStop = (deleted: boolean) =>
+      deleted
+        ? `${name} is deleted.`
+        : `${name} is not deleted: it holds one of your eight practice slots.`
+    console.log(`${name}, level ${level}. Ctrl-C or an error stops the run and deletes the world.`)
     const remove = () => run.delete().then(() => true, () => false)
     process.once("SIGINT", () => void remove().then((deleted) => exit(`Stopped. ${afterStop(deleted)}`)))
     await playPractice(run, level).catch(async (error: unknown) => {
