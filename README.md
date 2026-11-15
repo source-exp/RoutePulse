@@ -46,15 +46,9 @@ Every score below is verified in [`results/`](results/) with full console logs. 
 
 ---
 
-## 2. What Makes RoutePulse Unique
+## 2. System Architecture
 
-### Elegant — Few core mechanisms doing most of the work
-Instead of hundreds of lane-specific heuristics, one unified economic equation governs every decision:
-1. **Quote side (`estimator.ts`, `market.ts`):** Infer the competitor's current price distribution online from our own win/loss outcomes, compute our true dispatch cost (driver fee + return-flow imbalance + expected late-refund and dealer-trust risk + capacity shadow price), and maximize expected gross margin jointly across all delivery options.
-2. **Dispatch side (`bundling.ts`, `dispatch.ts`, `offers.ts`):** Pay less than the typical fee (`referenceFeeCents`) where drivers want to go (dense hubs, arriving-driver chains, 2–3 car corridor gigs), and escalate fees only during waking hours (`07:05–22:45`) when drivers actually read notifications.
-
-### Clear — Direct mapping from domain concepts to modular TypeScript
-Every subsystem lives in its own single-purpose file in [`src/`](src/) using Spread's exact vocabulary (`request`, `dealer`, `order`, `gig`, `fee`, `typical fee`, `list price`, `deadline`, `lastPickupAt`, `direct offer`):
+Every subsystem lives in its own single-purpose file in [`src/`](src/):
 
 ```text
 price_request ─► notes.ts (FI/SV/EN truth) ─► planner.ts (feasibility & 5 car rules)
@@ -67,18 +61,11 @@ order_won/lost ◄─ outbox.ts ◄─ market.ts (Copula menu) ◄─ estimator.
                                      └─► offers.ts   (chain & live-viewer direct offers)
 ```
 
-### Creative — Three non-obvious insights about dealers, drivers, and the week
-1. **Common-Provider-Shock Copula for Multi-Option Menus (`market.ts`):** A dealer does not roll three independent competitors for `same_day`, `next_day`, and `within_3_days` — **one competitor** prices all options from a shared hidden world/lane/day factor. Integrating over that single shared shock $U \in [0, 1]$ stops our own options from cannibalizing each other and steers Friday-deadline cars onto Monday (`within_3_days`) where 3.5 execution days exist with zero new requests.
-2. **Midnight Flu Fingerprinting & Night-Bundle Hold (`desk.ts`, `bundling.ts`):** Drivers stay home for the flu at the start of the day (`00:00–01:30` `gig_dropped` bursts without snow), while no driver reads app notifications between `23:00` and `07:00`. Detecting midnight drop bursts immediately shifts same-day pricing and holds night-dropped multi-car gigs intact until `09:15` instead of shattering them into expensive solo gigs at `02:00` while drivers sleep.
-3. **Treating Live `gig_viewed` Events as a Reveal of Who Works Today (`offers.ts`):** The driver list never shows which drivers decided to work today, and sending blind direct offers burns the 3-offers-per-driver daily limit on drivers who stayed home. RoutePulse treats recent `gig_viewed` events (`<= 20–25` minutes) as live proof that a driver has the app open right now — waking immediately on 1st-view bundle or home-return viewers (`<= 30 km` from delivery), reserving each driver's 3rd daily offer slot for high-value matches, and nudging active viewers `+3%..+13%` over the live app fee instead of raising the public board fee for everyone (which would teach all viewing drivers to wait for raises).
-
-### Robust — Proven on unseen weeks, network drops, and mid-run restarts
-- **Unseen-week stability:** `95 / 95` Ranked (`0.0%` not delivered) across 70 unseen random Level-8 weeks and 5 official ranking rounds, spanning severe driver shortages (`< 700` drivers) to dense rosters (`930+` drivers).
-- **Tear-free restart & live-clock resilience (`starter.ts`, `rejoin.ts`, `outbox.ts`):**
-  - Brackets `world.snapshot()` between `history0` and `tail` `world.events()` by sequence number (`seq`) so zero events are dropped or double-counted on a `--final` restart.
+- **Tear-free restart & live-clock resilience (`starter.ts`, `rejoin.ts`, `outbox.ts`, `spread.ts`):**
+  - Brackets `world.snapshot()` between `history0` and `tail` `world.events()` by sequence number (`seq`) and verifies `snapshot.now >= endsAt` on WebSocket close `1000` so zero events are dropped or double-counted across disconnects or `502/503/504` server restarts.
   - Reconstructs competitor beliefs, snow forecasts, dealer trust, `order_changed` shifts, and midnight-flu state via `rejoinDeskState()`.
   - Drains the WebSocket stream in 6 ms micro-batches and flushes urgent `quote` actions through a dedicated fast-lane (`<= 20` per batch) ahead of `post`/`offer` chunks (`<= 15`), keeping `respondBy` latency well inside the 4.5-second live-clock window without exhausting the 20 actions/sec `final-actions` token bucket.
-  - Never calls `world.delete()` on `--board` ranking runs on `SIGINT` or transient `502/503/504` errors, automatically resuming unfinished ranking runs instead of forfeiting them.
+  - Never calls `world.delete()` on `--board` ranking runs on `SIGINT` or transient network errors, automatically resuming unfinished ranking runs instead of forfeiting them.
 
 ---
 
