@@ -46,7 +46,7 @@ Every score below is verified in [`results/`](results/) with full console logs. 
 
 ---
 
-## 2. What Makes RoutePulse Unique (Jury Criteria Alignment)
+## 2. What Makes RoutePulse Unique
 
 ### Elegant — Few core mechanisms doing most of the work
 Instead of hundreds of lane-specific heuristics, one unified economic equation governs every decision:
